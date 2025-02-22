@@ -8,14 +8,14 @@ BLE Controller は以下の機能を提供します：
 
 1. BLE デバイスのスキャン (hci0)
 2. BLE デバイスへのコマンド送信 (hci1)
-3. リクエストキューによる並行処理の制御
+3. 優先順位付きリクエストキューによる並行処理の制御
 
 ## アーキテクチャ
 
 ```mermaid
 graph TD
     A[Client Service] -->|get/send request| B[Request Queue]
-    B -->|順次処理| C[BLE Controller]
+    B -->|優先順位処理| C[BLE Controller]
     C --> D[BLE Scanner - hci0]
     C --> E[BLE Commander - hci1]
     D -->|scan data| F[Scan Data Store]
@@ -26,24 +26,25 @@ graph TD
 
 ### 1. リクエストキューシステム
 
-リクエストを安全に管理し、順序立てて処理するキューシステムを実装しています。
+非同期リクエストを安全に管理し、順序立てて処理するキューシステムを実装しています。
 
 #### 特徴
 - 優先順位付きキュー管理
 - タイムスタンプベースの順序制御
 - 非同期処理による順次実行
 - エラーハンドリング
+- メトリクス収集
+- リトライ機能
 
 #### RequestTaskインターフェース
 ```typescript
-interface RequestTask {
-  id: string;          // タスクの一意識別子
-  type: 'GET' | 'SEND'; // リクエストタイプ
-  priority?: number;    // 優先順位（高いほど優先）
-  url: string;         // リクエスト先URL
-  payload?: any;       // SENDリクエスト時のデータ
-  timestamp: number;   // タスク作成時のタイムスタンプ
-}
+class RequestTask:
+    id: str          # タスクの一意識別子
+    type: CommandType # GET/SENDのリクエストタイプ
+    url: str         # リクエスト先のエンドポイント
+    priority: int    # 優先順位（高いほど優先）
+    payload: dict    # リクエストのデータ
+    timestamp: float # タスク作成時刻
 ```
 
 #### 優先順位の仕組み
@@ -71,17 +72,17 @@ interface RequestTask {
 
 スキャンデータの取得
 
-```typescript
-// Request
-const getTask: RequestTask = {
-    id: '1',
-    type: 'GET',
-    url: 'https://api.example.com/data',
-    priority: 1,
-    timestamp: Date.now()
-};
+```python
+# Request
+task = RequestTask(
+    id="get_1234567890",
+    type=CommandType.GET,
+    url="/scan_data",
+    priority=1,
+    payload={"timestamp": "2024-03-20T10:00:00"}
+)
 
-// Response
+# Response
 {
     "status": "success",
     "data": [
@@ -91,9 +92,9 @@ const getTask: RequestTask = {
             "rssi": -70,
             "timestamp": "2024-03-20T10:00:05",
             "manufacturer_data": {...}
-        },
-        ...
-    ]
+        }
+    ],
+    "error": null
 }
 ```
 
@@ -101,69 +102,87 @@ const getTask: RequestTask = {
 
 BLE デバイスへのコマンド送信
 
-```typescript
-// Request
-const sendTask: RequestTask = {
-    id: '2',
-    type: 'SEND',
-    url: 'https://api.example.com/data',
-    payload: { 
-        address: "XX:XX:XX:XX:XX:XX",
-        command: "turn_on",
-        parameters: {...}
-    },
-    priority: 2,
-    timestamp: Date.now()
-};
+```python
+# Request
+task = RequestTask(
+    id="send_1234567890",
+    type=CommandType.SEND,
+    url="/command",
+    priority=2,
+    payload={
+        "address": "XX:XX:XX:XX:XX:XX",
+        "command": "turn_on",
+        "parameters": {...}
+    }
+)
 
-// Response
+# Response
 {
     "status": "success",
-    "result": {...}
+    "data": {
+        "message": "Command executed successfully"
+    },
+    "error": null
 }
 ```
 
 ## エラーハンドリング
 
-- デバイス未発見
-- 接続タイムアウト
-- コマンド実行エラー
-- アダプタ利用不可
-- リクエストキューのエラー
+カスタム例外クラスによる詳細なエラー管理：
+- BLEControllerError: 基本例外クラス
+- QueueProcessingError: キュー処理エラー
+- QueueFullError: キューが満杯
+- DeviceConnectionError: デバイス接続エラー
+- TaskExecutionError: タスク実行エラー
 
-## 使用例
+## メトリクス
 
-```typescript
-import { RequestQueue } from './services/RequestQueue';
-import { RequestTask } from './types/RequestTask';
-
-// キューのインスタンス化
-const requestQueue = new RequestQueue();
-
-// GETリクエストの作成と実行
-const getTask: RequestTask = {
-    id: '1',
-    type: 'GET',
-    url: 'https://api.example.com/data',
-    priority: 1,
-    timestamp: Date.now()
-};
-
-requestQueue.enqueue(getTask);
-```
+キューのパフォーマンスモニタリング：
+- 処理済みタスク数
+- 失敗タスク数
+- 平均処理時間
+- 直近1000件の処理時間履歴
 
 ## 依存関係
 
 - bleak: BLE 通信ライブラリ
-- asyncio: 非同期処理
-- TypeScript: 型システムとコンパイラ
+- aiohttp: 非同期HTTP通信
+- tenacity: リトライ機能
+- pytest: テストフレームワーク
+
+## 使用例
+
+```python
+from ble_controller import BLEController
+from ble_controller.types.request_task import RequestTask, CommandType
+
+# コントローラーの初期化
+controller = BLEController()
+await controller.start()
+
+# GETリクエストの作成と実行
+task = RequestTask(
+    id="get_1",
+    type=CommandType.GET,
+    url="/scan_data",
+    priority=1
+)
+controller.request_queue.enqueue(task)
+
+# キューの完了待機
+await controller.wait_for_queue_completion()
+```
+
+## テスト
+
+```bash
+# テストの実行
+pytest tests/
+```
 
 ## 今後の改善予定
 
-- [ ] リトライ機能の追加
-- [ ] タイムアウト設定の実装
-- [ ] キューの最大サイズ制限
-- [ ] 処理状況のモニタリング機能
+todo
 
 ## ライセンス
 MIT

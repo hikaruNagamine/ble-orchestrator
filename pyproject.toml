@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ble_controller"
+version = "0.1.0"
+description = "BLE device controller with request queue"
+requires-python = ">=3.8"
+dependencies = [
+    "bleak",
+    "aiohttp",
+] 
