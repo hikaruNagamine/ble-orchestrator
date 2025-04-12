@@ -44,6 +44,37 @@ BLEデバイスからセンサーデータを収集したり、Bluetooth経由�
 +--------------------------------------------+
 ```
 
+```mermaid
+flowchart TD
+    subgraph clients["各種Pythonクライアント"]
+        client["センサー/制御スクリプト"]
+    end
+
+    subgraph orchestrator["BLE制御サービス (ble-orchestrator)"]
+        scan["🔄 スキャンスレッド
+        - bleak常時スキャン
+        - 最新10秒分キャッシュ保持"]
+        
+        queue["🧭 リクエスト処理キュー
+        - 優先度付きQueueで逐次処理
+        - タイムアウト監視"]
+        
+        recovery["⚠️ ハング検出・自動復旧
+        - retry / adapter reset / service再起動"]
+        
+        api["API: get_scan_result / read_sensor / send_command"]
+    end
+    
+    clients -->|IPC通信| orchestrator
+    
+    classDef default fill:#f9f9f9,stroke:#333,stroke-width:1px
+    classDef orchestrator fill:#e0f0ff,stroke:#333,stroke-width:2px
+    classDef clients fill:#e0ffe0,stroke:#333,stroke-width:2px
+    
+    class orchestrator orchestrator
+    class clients clients
+```
+
 ## インストール
 
 ### 必要環境
