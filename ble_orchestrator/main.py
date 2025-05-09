@@ -8,7 +8,7 @@ import logging
 import signal
 import sys
 
-from orchestrator.service import BLEOrchestratorService
+from ble_orchestrator.orchestrator.service import BLEOrchestratorService
 
 logger = logging.getLogger(__name__)
 
@@ -55,15 +55,22 @@ async def shutdown(service):
     await service.stop()
     
     # 現在のタスクを取得
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    current_task = asyncio.current_task()
+    tasks = [t for t in asyncio.all_tasks() if t is not current_task]
     
     # 残りのタスクをキャンセルして待機
-    for task in tasks:
-        task.cancel()
-    
     if tasks:
         logger.info(f"Waiting for {len(tasks)} tasks to complete...")
-        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # タスクをキャンセル
+        for task in tasks:
+            task.cancel()
+            
+        # タスクの完了を待機（短いタイムアウトでクリーンに終了）
+        try:
+            await asyncio.wait(tasks, timeout=3.0)
+        except Exception as e:
+            logger.error(f"Error waiting for tasks to complete: {e}")
     
     logger.info("Shutdown complete")
 

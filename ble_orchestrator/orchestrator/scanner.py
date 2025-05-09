@@ -40,7 +40,7 @@ class ScanCache:
             advertisement_data={
                 "local_name": adv_data.local_name,
                 "manufacturer_data": {
-                    k.hex(): list(v) for k, v in adv_data.manufacturer_data.items()
+                    str(k) if isinstance(k, int) else k.hex(): list(v) for k, v in adv_data.manufacturer_data.items()
                 },
                 "service_data": {
                     k: list(v) for k, v in adv_data.service_data.items()
@@ -53,17 +53,24 @@ class ScanCache:
         async with self._lock:
             self._cache[device.address].append(result)
         
-        logger.debug(f"Added scan result for {device.address} ({device.name}), RSSI: {adv_data.rssi}")
+        # logger.debug(f"Added scan result for {device.address} ({device.name}), RSSI: {adv_data.rssi}")
 
     def get_latest_result(self, address: str) -> Optional[ScanResult]:
         """
         指定MACアドレスの最新のスキャン結果を取得
         TTL切れの場合はNoneを返す
         """
+        logger.debug(f"get_latest_result: {address}")
+        # logger.debug(f"self._cache: {self._cache}")
+        logger.debug(f"self._cache[address]: {self._cache[address]}")
         if address not in self._cache or not self._cache[address]:
+            logger.debug(f"get_latest_result: {address} not in self._cache or not self._cache[address]")
             return None
         
         latest_result = self._cache[address][-1]
+        logger.debug(f"latest_result: {latest_result}")
+        logger.debug(f"latest_result.timestamp: {latest_result.timestamp}")
+        logger.debug(f"latest_result type: {type(latest_result)}")
         
         # TTLチェック
         if time.time() - latest_result.timestamp > self._ttl_seconds:
@@ -94,7 +101,7 @@ class BLEScanner:
 
     def __init__(self):
         self.is_running = False
-        self.scanner = BleakScanner()
+        self.scanner = BleakScanner(adapter="hci0")
         self.cache = ScanCache()
         self._stop_event = asyncio.Event()
         self._task = None
@@ -160,10 +167,16 @@ class BLEScanner:
         
         if self._task:
             try:
+                # タスクをキャンセル
                 self._task.cancel()
-                await asyncio.wait_for(self._task, timeout=2.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
+                # シールドしてタイムアウト付きで待機
+                await asyncio.wait_for(asyncio.shield(asyncio.gather(self._task, return_exceptions=True)), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("Timeout while waiting for scanner task to cancel")
+            except asyncio.CancelledError:
+                logger.debug("Scanner task cancelled successfully")
+            except Exception as e:
+                logger.error(f"Error cancelling scanner task: {e}")
             
         try:
             await self.scanner.stop()

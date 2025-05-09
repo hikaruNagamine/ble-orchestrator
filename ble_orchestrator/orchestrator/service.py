@@ -8,16 +8,21 @@ import logging
 import os
 import time
 from typing import Dict, List, Optional, Any, Union, cast
+import uuid
 
 from bleak.backends.device import BLEDevice
 
-from .config import LOG_DIR, LOG_FILE
+from .config import LOG_DIR, LOG_FILE, DEFAULT_REQUEST_TIMEOUT_SEC
 from .handler import BLERequestHandler
 from .ipc_server import IPCServer
 from .queue_manager import RequestQueueManager
 from .scanner import BLEScanner
-from .types import BLERequest, ReadRequest, ScanRequest, ServiceStatus, WriteRequest, ScanResult
+from .types import (
+    BLERequest, ReadRequest, ScanRequest, ServiceStatus, WriteRequest, 
+    ScanResult, NotificationRequest, NotificationData, RequestPriority, RequestStatus
+)
 from .watchdog import BLEWatchdog
+from .notification_manager import NotificationManager
 
 # ロガー設定
 logger = logging.getLogger(__name__)
@@ -41,7 +46,10 @@ class BLEOrchestratorService:
         self.scanner = BLEScanner()
         
         # リクエストハンドラー
-        self.handler = BLERequestHandler(self._get_ble_device)
+        self.handler = BLERequestHandler(
+            get_device_func=self._get_ble_device,
+            get_scan_data_func=self._get_ble_device
+        )
         
         # リクエストキュー
         self.queue_manager = RequestQueueManager(self.handler.handle_request)
@@ -50,6 +58,12 @@ class BLEOrchestratorService:
         self.watchdog = BLEWatchdog(
             self.handler.get_consecutive_failures,
             self.handler.reset_failure_count
+        )
+        
+        # 通知マネージャー
+        self.notification_manager = NotificationManager(
+            self._get_ble_device,
+            self._handle_notification
         )
         
         # IPCサーバー
@@ -70,7 +84,8 @@ class BLEOrchestratorService:
         
         # ルートロガー設定
         root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO)
+        # root_logger.setLevel(logging.INFO)
+        root_logger.setLevel(logging.DEBUG)
         
         # ファイルハンドラ
         file_handler = logging.FileHandler(LOG_FILE)
@@ -112,6 +127,9 @@ class BLEOrchestratorService:
             # ウォッチドッグ起動
             await self.watchdog.start()
             
+            # 通知マネージャー起動
+            await self.notification_manager.start()
+            
             # IPCサーバー起動
             await self.ipc_server.start()
             
@@ -129,49 +147,58 @@ class BLEOrchestratorService:
         各コンポーネントを逆順で停止
         """
         logger.info("Stopping BLE Orchestrator service...")
+        errors = []
         
         # IPCサーバー停止
         try:
             await self.ipc_server.stop()
         except Exception as e:
+            errors.append(f"IPC server: {e}")
             logger.error(f"Error stopping IPC server: {e}")
+        
+        # 通知マネージャー停止
+        try:
+            await self.notification_manager.stop()
+        except Exception as e:
+            errors.append(f"Notification manager: {e}")
+            logger.error(f"Error stopping notification manager: {e}")
         
         # ウォッチドッグ停止
         try:
             await self.watchdog.stop()
         except Exception as e:
+            errors.append(f"Watchdog: {e}")
             logger.error(f"Error stopping watchdog: {e}")
         
         # キューマネージャー停止
         try:
             await self.queue_manager.stop()
         except Exception as e:
+            errors.append(f"Queue manager: {e}")
             logger.error(f"Error stopping queue manager: {e}")
         
         # スキャナー停止
         try:
             await self.scanner.stop()
         except Exception as e:
+            errors.append(f"Scanner: {e}")
             logger.error(f"Error stopping scanner: {e}")
         
-        logger.info("BLE Orchestrator service stopped")
+        if errors:
+            logger.warning(f"Service stopped with {len(errors)} errors: {', '.join(errors)}")
+        else:
+            logger.info("BLE Orchestrator service stopped cleanly")
 
-    def _get_ble_device(self, mac_address: str) -> Optional[BLEDevice]:
+    def _get_ble_device(self, mac_address: str) -> Optional[Union[BLEDevice, str]]:
         """
         スキャン結果からBLEDeviceを取得
+        bleak 0.22.3では文字列のMACアドレスを直接使用することも可能
         """
         result = self.scanner.cache.get_latest_result(mac_address)
         if not result:
             return None
             
-        # BLEDeviceっぽいものを作る（ScanResultからの変換）
-        # 実際には実装はBLEDeviceに似せた独自クラスを作るべきかもしれない
-        class SimpleBLEDevice:
-            def __init__(self, address: str, name: Optional[str]):
-                self.address = address
-                self.name = name
-                
-        return SimpleBLEDevice(result.address, result.name)
+        return result
 
     def _get_scan_result(self, mac_address: str) -> Optional[ScanResult]:
         """
@@ -181,9 +208,30 @@ class BLEOrchestratorService:
 
     async def _enqueue_request(self, request: BLERequest) -> str:
         """
-        リクエストをキューに追加
+        リクエストをキューに入れるか、通知リクエストの場合は直接処理
         """
+        # 通知リクエストは別途処理
+        if isinstance(request, NotificationRequest):
+            try:
+                await self.notification_manager.process_notification_request(request)
+                return request.request_id
+            except Exception as e:
+                logger.error(f"Error processing notification request: {e}")
+                raise
+                
+        # 通常のリクエストはキューに追加
         return await self.queue_manager.enqueue_request(request)
+
+    async def _handle_notification(self, notification: NotificationData) -> None:
+        """
+        通知を受信したときの処理
+        IPCサーバー経由でクライアントに通知を送信
+        """
+        try:
+            # IPCサーバーに通知を送信
+            await self.ipc_server.send_notification(notification)
+        except Exception as e:
+            logger.error(f"Error sending notification to clients: {e}")
 
     def _get_service_status(self) -> Dict[str, Any]:
         """
@@ -196,7 +244,8 @@ class BLEOrchestratorService:
             adapter_status="ok" if self.handler.get_consecutive_failures() == 0 else "warning",
             queue_size=self.queue_manager.get_queue_size(),
             last_error=None,  # TODO: 最後のエラーを保持する仕組み
-            uptime_sec=uptime
+            uptime_sec=uptime,
+            active_subscriptions=self.notification_manager.get_active_subscriptions_count()
         )
         
         # 辞書形式に変換
@@ -207,4 +256,5 @@ class BLEOrchestratorService:
             "last_error": status.last_error,
             "uptime_sec": round(status.uptime_sec, 1),
             "active_devices": len(self.scanner.cache.get_all_devices()),
-        } 
+            "active_subscriptions": status.active_subscriptions
+        }

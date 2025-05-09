@@ -9,176 +9,76 @@ import logging
 import os
 import socket
 import uuid
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Callable, Awaitable
+from .request_client import BLERequestClient
+from .notification_client import BLENotificationClient
 
 logger = logging.getLogger(__name__)
-
 
 class BLEOrchestratorClient:
     """
     BLE Orchestratorのクライアント
     シンプルなインターフェースでBLE操作を要求
+    リクエスト用とノーティフィケーション用に別々のソケット接続を使用
     """
-
-    def __init__(
-        self, 
-        socket_path: Optional[str] = None,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        timeout: float = 10.0
-    ):
+    def __init__(self, socket_path: Optional[str] = None, host: Optional[str] = None, port: Optional[int] = None, timeout: float = 10.0):
         """
         初期化
         socket_path: UNIXソケットパス（Linuxのみ）
         host, port: TCPソケットパラメータ
         timeout: 通信タイムアウト
         """
-        self.socket_path = socket_path or os.environ.get(
-            "BLE_ORCHESTRATOR_SOCKET", 
-            "/tmp/ble-orchestrator.sock"
-        )
-        self.host = host or os.environ.get("BLE_ORCHESTRATOR_HOST", "127.0.0.1")
-        self.port = port or int(os.environ.get("BLE_ORCHESTRATOR_PORT", "8378"))
-        self.timeout = timeout
-        self.use_tcp = bool(host and port) or "BLE_ORCHESTRATOR_TCP" in os.environ
-        self._reader = None
-        self._writer = None
-        
-        if self.use_tcp:
-            logger.debug(f"Using TCP socket {self.host}:{self.port}")
-        else:
-            logger.debug(f"Using UNIX socket {self.socket_path}")
+        self.req = BLERequestClient(socket_path, host, port, timeout)
+        self.notif = BLENotificationClient(socket_path, host, port, timeout)
 
     async def connect(self) -> None:
         """
-        サーバーに接続
+        サーバーに接続（リクエスト用とノーティフィケーション用の両方）
         """
-        try:
-            if self.use_tcp:
-                self._reader, self._writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.host, self.port),
-                    timeout=self.timeout
-                )
-            else:
-                self._reader, self._writer = await asyncio.wait_for(
-                    asyncio.open_unix_connection(self.socket_path),
-                    timeout=self.timeout
-                )
-            logger.debug("Connected to BLE Orchestrator")
-        except (ConnectionRefusedError, FileNotFoundError) as e:
-            raise ConnectionError(f"Failed to connect to BLE Orchestrator: {e}")
-        except asyncio.TimeoutError:
-            raise TimeoutError("Connection to BLE Orchestrator timed out")
+        await self.req.connect()
+        await self.notif.connect()
+        logger.debug("Connected to BLE Orchestrator (both request and notification)")
 
-    async def close(self) -> None:
+    async def disconnect(self) -> None:
         """
-        接続を閉じる
+        接続を閉じる（リクエスト用とノーティフィケーション用の両方）
         """
-        if self._writer:
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-                logger.debug("Connection closed")
-            except Exception as e:
-                logger.error(f"Error closing connection: {e}")
-            self._writer = None
-            self._reader = None
+        await self.req.disconnect()
+        await self.notif.disconnect()
+        logger.debug("Disconnected from BLE Orchestrator (both request and notification)")
 
-    async def __aenter__(self):
-        """
-        コンテキストマネージャーのエントリー
-        """
-        await self.connect()
-        return self
+    # ---------------- リクエスト関連のProxy関数 ----------------
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """
-        コンテキストマネージャーのイグジット
-        """
-        await self.close()
-
-    async def _send_request(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        リクエストを送信して応答を受信
-        """
-        if not self._reader or not self._writer:
-            await self.connect()
-            
-        # リクエスト作成
-        request = {"command": command, **params}
-        request_str = json.dumps(request) + "\n"
-        
-        try:
-            # リクエスト送信
-            self._writer.write(request_str.encode())
-            await self._writer.drain()
-            
-            # 応答受信
-            response_bytes = await asyncio.wait_for(
-                self._reader.readline(), 
-                timeout=self.timeout
-            )
-            
-            if not response_bytes:
-                raise ConnectionError("Connection closed by server")
-                
-            # 応答解析
-            response = json.loads(response_bytes.decode())
-            
-            # エラー処理
-            if response.get("status") == "error":
-                error_msg = response.get("error", "Unknown error")
-                raise RuntimeError(f"Server returned error: {error_msg}")
-                
-            return response
-                
-        except asyncio.TimeoutError:
-            raise TimeoutError(f"Request timed out after {self.timeout} seconds")
-        except json.JSONDecodeError:
-            raise ValueError("Invalid JSON response from server")
-
-    async def get_scan_result(self, mac_address: str) -> Dict[str, Any]:
-        """
-        スキャン結果を取得
-        
-        引数:
-            mac_address: MACアドレス
-            
-        戻り値:
-            スキャン結果の辞書
-        """
-        response = await self._send_request("get_scan_result", {"mac_address": mac_address})
-        return response.get("data", {})
-
-    async def read_sensor(
+    async def read_command(
         self, 
         mac_address: str, 
         service_uuid: str, 
         characteristic_uuid: str,
         priority: str = "NORMAL",
         timeout: float = 10.0
-    ) -> str:
+    ) -> asyncio.Future:
         """
-        センサー値を読み取り
+        デバイスの特性値を読み取るコマンドをリクエスト
+        Futureを返すので、await result_future で結果を取得できる
+        """
+        return await self.req.read_command(
+            mac_address, service_uuid, characteristic_uuid, priority, timeout
+        )
         
-        引数:
-            mac_address: MACアドレス
-            service_uuid: サービスUUID
-            characteristic_uuid: 特性UUID
-            priority: 優先度（HIGH/NORMAL/LOW）
-            timeout: タイムアウト秒数
-            
-        戻り値:
-            リクエストID
+    async def scan_command(
+        self,
+        mac_address: str,
+        service_uuid: Optional[str] = None,
+        characteristic_uuid: Optional[str] = None
+    ) -> asyncio.Future:
         """
-        response = await self._send_request("read_sensor", {
-            "mac_address": mac_address,
-            "service_uuid": service_uuid,
-            "characteristic_uuid": characteristic_uuid,
-            "priority": priority,
-            "timeout": timeout
-        })
-        return response.get("request_id", "")
+        スキャン済みデータからデバイスの情報を取得
+        デバイスに接続せずに、最後のスキャン結果からデータを返す
+        Futureを返すので、await result_future で結果を取得できる
+        """
+        return await self.req.scan_command(
+            mac_address, service_uuid, characteristic_uuid
+        )
 
     async def send_command(
         self, 
@@ -189,60 +89,40 @@ class BLEOrchestratorClient:
         response_required: bool = False,
         priority: str = "NORMAL",
         timeout: float = 10.0
+    ) -> asyncio.Future:
+        """
+        コマンド送信をリクエスト
+        Futureを返すので、await result_future で結果を取得できる
+        """
+        return await self.req.send_command(
+            mac_address, service_uuid, characteristic_uuid, 
+            data, response_required, priority, timeout
+        )
+
+    # ---------------- 通知関連のProxy関数 ----------------
+
+    async def subscribe_notifications(
+        self,
+        mac_address: str,
+        service_uuid: str,
+        characteristic_uuid: str,
+        callback: Callable[[Dict[str, Any]], Awaitable[None]],
+        callback_id: Optional[str] = None,
     ) -> str:
         """
-        コマンドを送信
-        
-        引数:
-            mac_address: MACアドレス
-            service_uuid: サービスUUID
-            characteristic_uuid: 特性UUID
-            data: 送信データ（16進文字列、バイト列、整数リスト）
-            response_required: レスポンスが必要かどうか
-            priority: 優先度（HIGH/NORMAL/LOW）
-            timeout: タイムアウト秒数
-            
-        戻り値:
-            リクエストID
+        BLE通知を購読
+        callback: 通知を受信したときに呼び出される非同期コールバック関数
+        callback_id: コールバックの識別子（省略時は自動生成）
         """
-        # データ形式の変換
-        if isinstance(data, bytes):
-            data_hex = data.hex()
-        elif isinstance(data, list):
-            data_hex = bytes(data).hex()
-        else:
-            data_hex = data  # 文字列前提
-            
-        response = await self._send_request("send_command", {
-            "mac_address": mac_address,
-            "service_uuid": service_uuid,
-            "characteristic_uuid": characteristic_uuid,
-            "data": data_hex,
-            "response_required": response_required,
-            "priority": priority,
-            "timeout": timeout
-        })
-        return response.get("request_id", "")
+        return await self.notif.subscribe_notifications(
+            mac_address, service_uuid, characteristic_uuid, callback, callback_id
+        )
 
-    async def get_request_status(self, request_id: str) -> Dict[str, Any]:
+    async def unsubscribe_notifications(
+        self,
+        callback_id: str
+    ) -> bool:
         """
-        リクエストの処理状況を確認
-        
-        引数:
-            request_id: リクエストID
-            
-        戻り値:
-            ステータス情報の辞書
+        通知購読を解除
         """
-        response = await self._send_request("get_request_status", {"request_id": request_id})
-        return response
-
-    async def get_service_status(self) -> Dict[str, Any]:
-        """
-        サービスの状態を取得
-        
-        戻り値:
-            サービスステータスの辞書
-        """
-        response = await self._send_request("status", {})
-        return response.get("data", {}) 
+        return await self.notif.unsubscribe_notifications(callback_id) 

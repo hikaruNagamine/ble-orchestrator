@@ -34,4 +34,7 @@ IPC_SOCKET_PATH = os.environ.get(
 )
 IPC_LISTEN_HOST = os.environ.get("BLE_ORCHESTRATOR_HOST", "127.0.0.1")
 IPC_LISTEN_PORT = int(os.environ.get("BLE_ORCHESTRATOR_PORT", "8378"))  # BLE on phone keypad
-IPC_MAX_CONNECTIONS = 10 
+IPC_MAX_CONNECTIONS = 10
+
+# リクエストのデフォルトタイムアウト (秒)
+DEFAULT_REQUEST_TIMEOUT_SEC = 10.0 

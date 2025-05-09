@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "BLE制御用の常駐サービス"
 requires-python = ">=3.9"
 dependencies = [
-    "bleak==0.21.1",
+    "bleak==0.22.3",
     "dataclasses-json",
     "aiofiles",
 ]
