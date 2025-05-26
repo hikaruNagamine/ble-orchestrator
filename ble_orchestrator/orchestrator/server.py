@@ -19,4 +19,4 @@
         self.watchdog = BLEWatchdog(
             self.handler.get_consecutive_failures,
             self.handler.reset_failure_count
-        ) 
+        )

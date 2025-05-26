@@ -54,6 +54,8 @@ graph TD
 
 ### セットアップ
 
+#### 標準的なインストール方法
+
 ```bash
 # リポジトリをクローン
 git clone https://github.com/username/ble-orchestrator.git
@@ -66,6 +68,21 @@ source venv/bin/activate
 # 依存パッケージのインストール
 pip install -r requirements.txt
 ```
+
+#### 特定の仮想環境へのインストール
+
+特定のPython仮想環境（例：`/var/temp/dynlibs/pyvenv`）にインストールする場合：
+
+```bash
+# リポジトリをクローン
+git clone https://github.com/username/ble-orchestrator.git
+cd ble-orchestrator
+
+# 特定の仮想環境のPythonを使用してインストール
+/var/temp/dynlibs/pyvenv/bin/pip install .
+```
+
+これにより、指定した仮想環境のPythonから`ble-orchestrator`パッケージが利用可能になります。
 
 ### systemdによる自動起動設定（Linux）
 
