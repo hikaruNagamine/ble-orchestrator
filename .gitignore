@@ -1,0 +1,30 @@
+# Virtual environment
+venv/
+
+# Compiled python files
+__pycache__/
+*.py[cod]
+
+# Egg and build files
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Environment and configuration files
+.env
+.DS_Store
+*.log
+
+# Test and coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+*.cover
+*.py,cover
+.hypothesis/
+
+# IDE and editor specific files
+.vscode/
+.idea/ 

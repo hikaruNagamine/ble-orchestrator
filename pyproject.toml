@@ -1,13 +1,29 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
-name = "ble_controller"
+name = "ble-orchestrator"
 version = "0.1.0"
-description = "BLE device controller with request queue"
-requires-python = ">=3.8"
+description = "BLE制御用の常駐サービス"
+requires-python = ">=3.9"
 dependencies = [
-    "bleak",
-    "aiohttp",
-] 
+    "bleak==0.22.3",
+    "dataclasses-json",
+    "aiofiles",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.mypy]
+python_version = 3.9
+strict = true
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "B", "I"]
+ignore = ["E501"]
+target-version = "py39" 
