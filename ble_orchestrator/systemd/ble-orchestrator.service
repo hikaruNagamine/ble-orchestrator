@@ -8,6 +8,8 @@ WorkingDirectory=/path/to/ble_orchestrator
 Restart=on-failure
 StandardOutput=journal
 StandardError=journal
+TimeoutStopSec=10
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target 
