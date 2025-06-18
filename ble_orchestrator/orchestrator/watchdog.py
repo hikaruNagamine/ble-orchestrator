@@ -42,6 +42,26 @@ class BLEWatchdog:
         self._task = None
         self._recovery_in_progress = False
         self._start_time = time.time()
+        self._component_issues = {}  # コンポーネントごとの問題を追跡
+
+    async def notify_component_issue(self, component_name: str, issue_description: str) -> None:
+        """
+        コンポーネントから問題の通知を受け取る
+        component_name: 問題を報告するコンポーネントの名前
+        issue_description: 問題の説明
+        """
+        logger.warning(f"Component issue reported - {component_name}: {issue_description}")
+        
+        # コンポーネントの問題を記録
+        self._component_issues[component_name] = {
+            'description': issue_description,
+            'timestamp': time.time()
+        }
+        
+        # 即座に復旧プロセスを開始
+        if not self._recovery_in_progress:
+            logger.info(f"Starting recovery process due to {component_name} issue")
+            asyncio.create_task(self._recover_ble_adapter())
 
     async def start(self) -> None:
         """

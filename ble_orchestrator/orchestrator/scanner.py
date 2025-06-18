@@ -18,6 +18,10 @@ from .types import ScanResult
 
 logger = logging.getLogger(__name__)
 
+# スキャナー再作成の最小間隔（秒）
+MIN_SCANNER_RECREATE_INTERVAL = 300  # 5分
+# デバイス未検出の許容時間（秒）
+NO_DEVICES_THRESHOLD = 60
 
 class ScanCache:
     """
@@ -100,7 +104,7 @@ class BLEScanner:
     BLEデバイスの常時スキャンとキャッシュ管理
     """
 
-    def __init__(self):
+    def __init__(self, notify_watchdog_func=None):
         self.is_running = False
         self.scanner = BleakScanner(adapter="hci0")
         self.cache = ScanCache()
@@ -110,28 +114,12 @@ class BLEScanner:
         self._last_device_count = 0
         self._no_devices_count = 0
         self._recreate_count = 0
+        self._notify_watchdog_func = notify_watchdog_func
+        self._last_recreate_time = 0
+        self._recovery_in_progress = False
         
         # スキャン結果のコールバック設定
         self.scanner.register_detection_callback(self._detection_callback)
-
-    async def _restart_bluetooth_stack(self) -> None:
-        """
-        Bluetoothスタックを再起動
-        """
-        logger.info("Restarting Bluetooth stack")
-        try:
-            # Bluetoothサービスを再起動
-            subprocess.run(["sudo", "systemctl", "restart", "bluetooth"], check=True)
-            await asyncio.sleep(2.0)  # 再起動を待機
-            
-            # hci0アダプターをリセット
-            subprocess.run(["sudo", "hciconfig", "hci0", "reset"], check=True)
-            await asyncio.sleep(1.0)  # リセットを待機
-            
-            logger.info("Bluetooth stack restarted successfully")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to restart Bluetooth stack: {e}")
-            raise
 
     async def _detection_callback(self, device: BLEDevice, adv_data: AdvertisementData) -> None:
         """
@@ -144,7 +132,20 @@ class BLEScanner:
         """
         スキャナーを完全に再作成
         """
+        # 既に復旧処理中の場合は何もしない
+        if self._recovery_in_progress:
+            logger.info("Recovery already in progress, skipping scanner recreation")
+            return
+            
+        # 最小再作成間隔をチェック
+        current_time = time.time()
+        if current_time - self._last_recreate_time < MIN_SCANNER_RECREATE_INTERVAL:
+            logger.info("Skipping scanner recreation due to minimum interval restriction")
+            return
+            
+        self._recovery_in_progress = True
         logger.info("Recreating scanner")
+        
         try:
             # 現在のスキャナーを停止
             if self.scanner.is_scanning:
@@ -153,12 +154,21 @@ class BLEScanner:
             
             # 再作成回数をカウント
             self._recreate_count += 1
+            self._last_recreate_time = current_time
             
-            # 3回連続で再作成が必要な場合はBluetoothスタックを再起動
+            # 3回連続で再作成が必要な場合はウォッチドッグに通知
             if self._recreate_count >= 3:
-                logger.warning("Multiple scanner recreations required, restarting Bluetooth stack")
-                await self._restart_bluetooth_stack()
+                logger.warning("Multiple scanner recreations required, notifying watchdog")
+                if self._notify_watchdog_func:
+                    try:
+                        self._notify_watchdog_func()
+                        logger.info("Watchdog notified of scanner issues")
+                        # ウォッチドッグに任せて、しばらく再作成を試みない
+                        await asyncio.sleep(60)  # ウォッチドッグの処理を待つ
+                    except Exception as e:
+                        logger.error(f"Failed to notify watchdog: {e}")
                 self._recreate_count = 0
+                return
             
             # 新しいスキャナーを作成
             self.scanner = BleakScanner(adapter="hci0")
@@ -169,9 +179,12 @@ class BLEScanner:
             self._last_scan_time = time.time()
             self._no_devices_count = 0
             logger.info("Scanner recreated successfully")
+            
         except Exception as e:
             logger.error(f"Failed to recreate scanner: {e}")
             raise
+        finally:
+            self._recovery_in_progress = False
 
     async def _scan_loop(self) -> None:
         """
@@ -191,29 +204,30 @@ class BLEScanner:
                 if active_count == 0:
                     self._no_devices_count += 1
                     
-                    # 30秒以上デバイスが検出されない場合（SCAN_INTERVAL_SECが1秒の場合、30回）
-                    if self._no_devices_count >= 30:
-                        logger.warning("No devices detected for 30 seconds, recreating scanner")
+                    # NO_DEVICES_THRESHOLD秒以上デバイスが検出されない場合のみ再作成
+                    if self._no_devices_count >= NO_DEVICES_THRESHOLD:
+                        logger.warning(f"No devices detected for {NO_DEVICES_THRESHOLD} seconds, recreating scanner")
                         await self._recreate_scanner()
                 else:
                     self._no_devices_count = 0
                     self._last_device_count = active_count
-                    self._recreate_count = 0  # 正常に動作している場合はカウントをリセット
+                    # デバイスが検出された場合は再作成カウントをリセット
+                    if self._recreate_count > 0:
+                        logger.info("Devices detected, resetting recreation count")
+                        self._recreate_count = 0
                 
                 # 最後のスキャンから一定時間経過している場合
-                if time.time() - self._last_scan_time > 30.0:
-                    logger.warning("No scan results for 30 seconds, recreating scanner")
+                if time.time() - self._last_scan_time > NO_DEVICES_THRESHOLD:
+                    logger.warning(f"No scan results for {NO_DEVICES_THRESHOLD} seconds, recreating scanner")
                     await self._recreate_scanner()
                     
         except asyncio.CancelledError:
             logger.info("Scan loop cancelled")
         except Exception as e:
             logger.error(f"Error in scan loop: {e}")
-            # エラー発生時もスキャナーを再作成
-            try:
-                await self._recreate_scanner()
-            except Exception as recreate_error:
-                logger.error(f"Failed to recreate scanner after error: {recreate_error}")
+            # エラー発生時は即座に再作成せず、ウォッチドッグに任せる
+            if self._notify_watchdog_func:
+                self._notify_watchdog_func()
         finally:
             logger.info("Scan loop terminated")
 

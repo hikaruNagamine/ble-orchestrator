@@ -42,9 +42,6 @@ class BLEOrchestratorService:
         self._setup_logging()
         self._start_time = time.time()
         
-        # スキャナー
-        self.scanner = BLEScanner()
-        
         # リクエストハンドラー
         self.handler = BLERequestHandler(
             get_device_func=self._get_ble_device,
@@ -59,6 +56,9 @@ class BLEOrchestratorService:
             self.handler.get_consecutive_failures,
             self.handler.reset_failure_count
         )
+        
+        # スキャナー（ウォッチドッグ通知機能付き）
+        self.scanner = BLEScanner(notify_watchdog_func=self._notify_watchdog)
         
         # 通知マネージャー
         self.notification_manager = NotificationManager(
@@ -258,3 +258,19 @@ class BLEOrchestratorService:
             "active_devices": len(self.scanner.cache.get_all_devices()),
             "active_subscriptions": status.active_subscriptions
         }
+
+    def _notify_watchdog(self) -> None:
+        """
+        ウォッチドッグ通知機能
+        スキャナーの問題をウォッチドッグに通知
+        """
+        logger.info("Notifying watchdog of scanner issues")
+        # 非同期メソッドを同期的なコンテキストから呼び出すためのヘルパー
+        async def _async_notify():
+            await self.watchdog.notify_component_issue(
+                "scanner",
+                "Scanner detected potential Bluetooth stack issues"
+            )
+            
+        # 非同期通知をイベントループで実行
+        asyncio.create_task(_async_notify())
