@@ -90,8 +90,8 @@ class BLERequestHandler:
         # スキャン済みデータを取得
         scan_data = self._get_scan_data_func(request.mac_address)
         if not scan_data:
-            logger.error(f"No scan data found for device {request.mac_address}")
-            raise ValueError(f"No scan data found for device {request.mac_address}")
+            logger.warning(f"No scan data found for device {request.mac_address}")
+            return
         
         logger.debug(f"scan_data: {scan_data}")
 

@@ -5,6 +5,7 @@ BLEスキャナーモジュール - BLEデバイスの常時スキャンとキ�
 import asyncio
 import logging
 import time
+import subprocess
 from collections import defaultdict, deque
 from typing import Dict, List, Optional, Set
 
@@ -105,15 +106,116 @@ class BLEScanner:
         self.cache = ScanCache()
         self._stop_event = asyncio.Event()
         self._task = None
+        self._last_scan_time = time.time()
+        self._last_device_count = 0
+        self._no_devices_count = 0
+        self._recreate_count = 0
         
         # スキャン結果のコールバック設定
         self.scanner.register_detection_callback(self._detection_callback)
+
+    async def _restart_bluetooth_stack(self) -> None:
+        """
+        Bluetoothスタックを再起動
+        """
+        logger.info("Restarting Bluetooth stack")
+        try:
+            # Bluetoothサービスを再起動
+            subprocess.run(["sudo", "systemctl", "restart", "bluetooth"], check=True)
+            await asyncio.sleep(2.0)  # 再起動を待機
+            
+            # hci0アダプターをリセット
+            subprocess.run(["sudo", "hciconfig", "hci0", "reset"], check=True)
+            await asyncio.sleep(1.0)  # リセットを待機
+            
+            logger.info("Bluetooth stack restarted successfully")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to restart Bluetooth stack: {e}")
+            raise
 
     async def _detection_callback(self, device: BLEDevice, adv_data: AdvertisementData) -> None:
         """
         スキャン結果のコールバック
         """
+        self._last_scan_time = time.time()
         await self.cache.add_result(device, adv_data)
+
+    async def _recreate_scanner(self) -> None:
+        """
+        スキャナーを完全に再作成
+        """
+        logger.info("Recreating scanner")
+        try:
+            # 現在のスキャナーを停止
+            if self.scanner.is_scanning:
+                await self.scanner.stop()
+            await asyncio.sleep(1.0)
+            
+            # 再作成回数をカウント
+            self._recreate_count += 1
+            
+            # 3回連続で再作成が必要な場合はBluetoothスタックを再起動
+            if self._recreate_count >= 3:
+                logger.warning("Multiple scanner recreations required, restarting Bluetooth stack")
+                await self._restart_bluetooth_stack()
+                self._recreate_count = 0
+            
+            # 新しいスキャナーを作成
+            self.scanner = BleakScanner(adapter="hci0")
+            self.scanner.register_detection_callback(self._detection_callback)
+            
+            # スキャンを再開
+            await self.scanner.start()
+            self._last_scan_time = time.time()
+            self._no_devices_count = 0
+            logger.info("Scanner recreated successfully")
+        except Exception as e:
+            logger.error(f"Failed to recreate scanner: {e}")
+            raise
+
+    async def _scan_loop(self) -> None:
+        """
+        スキャンループ
+        """
+        try:
+            while not self._stop_event.is_set():
+                # スキャナーはコールバック方式なので、待機するだけ
+                await asyncio.sleep(SCAN_INTERVAL_SEC)
+                
+                # 定期的にアクティブデバイス数をログ出力
+                active_devices = self.cache.get_all_devices()
+                active_count = len(active_devices)
+                logger.debug(f"Active BLE devices: {active_count}")
+                
+                # デバイス数が0の場合の処理
+                if active_count == 0:
+                    self._no_devices_count += 1
+                    
+                    # 30秒以上デバイスが検出されない場合（SCAN_INTERVAL_SECが1秒の場合、30回）
+                    if self._no_devices_count >= 30:
+                        logger.warning("No devices detected for 30 seconds, recreating scanner")
+                        await self._recreate_scanner()
+                else:
+                    self._no_devices_count = 0
+                    self._last_device_count = active_count
+                    self._recreate_count = 0  # 正常に動作している場合はカウントをリセット
+                
+                # 最後のスキャンから一定時間経過している場合
+                if time.time() - self._last_scan_time > 30.0:
+                    logger.warning("No scan results for 30 seconds, recreating scanner")
+                    await self._recreate_scanner()
+                    
+        except asyncio.CancelledError:
+            logger.info("Scan loop cancelled")
+        except Exception as e:
+            logger.error(f"Error in scan loop: {e}")
+            # エラー発生時もスキャナーを再作成
+            try:
+                await self._recreate_scanner()
+            except Exception as recreate_error:
+                logger.error(f"Failed to recreate scanner after error: {recreate_error}")
+        finally:
+            logger.info("Scan loop terminated")
 
     async def start(self) -> None:
         """
@@ -135,25 +237,6 @@ class BLEScanner:
             self.is_running = False
             logger.error(f"Failed to start BLE scanner: {e}")
             raise
-
-    async def _scan_loop(self) -> None:
-        """
-        スキャンループ
-        """
-        try:
-            while not self._stop_event.is_set():
-                # スキャナーはコールバック方式なので、待機するだけ
-                await asyncio.sleep(SCAN_INTERVAL_SEC)
-                
-                # 定期的にアクティブデバイス数をログ出力
-                active_devices = self.cache.get_all_devices()
-                logger.debug(f"Active BLE devices: {len(active_devices)}")
-        except asyncio.CancelledError:
-            logger.info("Scan loop cancelled")
-        except Exception as e:
-            logger.error(f"Error in scan loop: {e}")
-        finally:
-            logger.info("Scan loop terminated")
 
     async def stop(self) -> None:
         """
