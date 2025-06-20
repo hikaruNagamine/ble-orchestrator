@@ -7,6 +7,7 @@ from enum import Enum, auto
 from typing import Any, Dict, Optional, List, Callable, Awaitable, Union
 from dataclasses_json import dataclass_json
 import asyncio
+import time
 
 
 class RequestPriority(Enum):
@@ -47,6 +48,7 @@ class BLERequest:
     status: RequestStatus = RequestStatus.PENDING
     error_message: Optional[str] = None
     response_data: Any = None
+    created_at: float = field(default_factory=time.time)  # リクエスト作成時刻
     _done_event: asyncio.Event = field(default_factory=asyncio.Event, compare=False)
 
     async def wait_until_done(self, timeout: Optional[float] = None) -> None:

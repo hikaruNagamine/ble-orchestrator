@@ -11,6 +11,8 @@ from typing import Callable, Optional
 from .config import (
     ADAPTER_RESET_COMMAND,
     BLUETOOTH_RESTART_COMMAND,
+    ADAPTER_STATUS_COMMAND,
+    BLE_ADAPTERS,
     CONSECUTIVE_FAILURES_THRESHOLD,
     WATCHDOG_CHECK_INTERVAL_SEC,
 )
@@ -27,22 +29,23 @@ class BLEWatchdog:
         self,
         get_failures_func: Callable[[], int],
         reset_failures_func: Callable[[], None],
-        adapter_name: str = "hci0",
+        adapters: Optional[list] = None,
     ):
         """
         初期化
         get_failures_func: 連続失敗回数を取得する関数
         reset_failures_func: 失敗カウンタをリセットする関数
-        adapter_name: BLEアダプタ名
+        adapters: BLEアダプタ名のリスト（デフォルト: config.BLE_ADAPTERS）
         """
         self._get_failures_func = get_failures_func
         self._reset_failures_func = reset_failures_func
-        self._adapter_name = adapter_name
+        self._adapters = adapters or BLE_ADAPTERS
         self._stop_event = asyncio.Event()
         self._task = None
         self._recovery_in_progress = False
         self._start_time = time.time()
         self._component_issues = {}  # コンポーネントごとの問題を追跡
+        self._adapter_status = {}  # 各アダプタの状態を追跡
 
     async def notify_component_issue(self, component_name: str, issue_description: str) -> None:
         """
@@ -138,43 +141,146 @@ class BLEWatchdog:
     async def _recover_ble_adapter(self) -> None:
         """
         BLEアダプタの復旧を試みる
-        1. アダプタリセット
-        2. Bluetoothサービス再起動
+        1. 各アダプタの状態確認
+        2. 問題のあるアダプタのリセット
+        3. Bluetoothサービス再起動（必ず実行）
         """
         self._recovery_in_progress = True
         
         try:
-            # まずアダプタリセットを試行
-            logger.info(f"Attempting to reset BLE adapter {self._adapter_name}")
-            reset_cmd = ADAPTER_RESET_COMMAND.format(adapter=self._adapter_name)
+            logger.info(f"Starting BLE adapter recovery for adapters: {self._adapters}")
             
-            success = await self._run_shell_command(reset_cmd)
-            if success:
-                logger.info(f"Successfully reset BLE adapter {self._adapter_name}")
-                self._reset_failures_func()
-                self._recovery_in_progress = False
-                return
+            # 1. 各アダプタの状態を確認
+            adapter_issues = []
+            for adapter in self._adapters:
+                status = await self._check_adapter_status(adapter)
+                self._adapter_status[adapter] = status
                 
-            # アダプタリセットが失敗した場合はBluetoothサービス再起動を試行
-            logger.warning(
-                f"Adapter reset failed. Attempting to restart Bluetooth service"
-            )
+                if status != "UP RUNNING":
+                    adapter_issues.append(adapter)
+                    logger.warning(f"Adapter {adapter} has issues: {status}")
+            
+            # 2. 問題のあるアダプタをリセット
+            if adapter_issues:
+                logger.info(f"Resetting problematic adapters: {adapter_issues}")
+                for adapter in adapter_issues:
+                    success = await self._reset_single_adapter(adapter)
+                    if success:
+                        logger.info(f"Successfully reset adapter {adapter}")
+                    else:
+                        logger.error(f"Failed to reset adapter {adapter}")
+                
+                # リセット後に少し待機
+                await asyncio.sleep(3.0)
+                
+                # リセット後の状態を再確認
+                still_problematic = []
+                for adapter in adapter_issues:
+                    status = await self._check_adapter_status(adapter)
+                    self._adapter_status[adapter] = status
+                    
+                    if status != "UP RUNNING":
+                        still_problematic.append(adapter)
+                        logger.warning(f"Adapter {adapter} still has issues after reset: {status}")
+            
+            # 3. Bluetoothサービス再起動（必ず実行）
+            logger.info("Performing Bluetooth service restart as part of recovery process")
             
             success = await self._run_shell_command(BLUETOOTH_RESTART_COMMAND)
             if success:
                 logger.info("Successfully restarted Bluetooth service")
-                # 再起動後に少し待機
-                await asyncio.sleep(5.0)
-                self._reset_failures_func()
+                # 再起動後に十分な待機時間
+                await asyncio.sleep(10.0)
+                
+                # 再起動後の最終確認
+                final_issues = []
+                for adapter in self._adapters:
+                    status = await self._check_adapter_status(adapter)
+                    self._adapter_status[adapter] = status
+                    
+                    if status != "UP RUNNING":
+                        final_issues.append(adapter)
+                        logger.warning(f"Adapter {adapter} still has issues after service restart: {status}")
+                
+                if final_issues:
+                    logger.error(
+                        f"Failed to recover adapters {final_issues} after service restart. "
+                        "Manual intervention may be required."
+                    )
+                else:
+                    logger.info("All adapters recovered successfully after service restart")
+                    self._reset_failures_func()
             else:
-                logger.error(
-                    "Failed to recover BLE adapter. Manual intervention may be required."
-                )
+                logger.error("Failed to restart Bluetooth service")
+                # サービス再起動に失敗した場合でも、アダプタリセットが成功していれば失敗カウンタをリセット
+                if not adapter_issues or not still_problematic:
+                    logger.info("Adapter reset was successful, resetting failure counter despite service restart failure")
+                    self._reset_failures_func()
         
         except Exception as e:
             logger.error(f"Error during BLE adapter recovery: {e}")
         finally:
             self._recovery_in_progress = False
+
+    async def _check_adapter_status(self, adapter: str) -> str:
+        """
+        アダプタの状態を確認
+        """
+        try:
+            cmd = ADAPTER_STATUS_COMMAND.format(adapter=adapter)
+            result = await self._run_shell_command_with_output(cmd)
+            
+            if "UP RUNNING" in result:
+                return "UP RUNNING"
+            elif "DOWN" in result:
+                return "DOWN"
+            elif "No such device" in result:
+                return "NOT_FOUND"
+            else:
+                return "UNKNOWN"
+        except Exception as e:
+            logger.error(f"Error checking status for adapter {adapter}: {e}")
+            return "ERROR"
+
+    async def _reset_single_adapter(self, adapter: str) -> bool:
+        """
+        単一アダプタをリセット
+        """
+        try:
+            logger.info(f"Resetting adapter {adapter}")
+            reset_cmd = ADAPTER_RESET_COMMAND.format(adapter=adapter)
+            return await self._run_shell_command(reset_cmd)
+        except Exception as e:
+            logger.error(f"Error resetting adapter {adapter}: {e}")
+            return False
+
+    async def _run_shell_command_with_output(self, command: str) -> str:
+        """
+        シェルコマンドを実行して出力を取得
+        """
+        logger.debug(f"Running command: {command}")
+        
+        try:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                output = stdout.decode().strip()
+                logger.debug(f"Command succeeded: {output}")
+                return output
+            else:
+                error_output = stderr.decode().strip()
+                logger.error(f"Command failed with exit code {process.returncode}: {error_output}")
+                return error_output
+                
+        except Exception as e:
+            logger.error(f"Failed to execute command '{command}': {e}")
+            return str(e)
 
     async def _run_shell_command(self, command: str) -> bool:
         """

@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, cast, Union
 from bleak import BleakClient, BleakError
 from bleak.backends.device import BLEDevice
 
-from .config import BLE_CONNECT_TIMEOUT_SEC, BLE_RETRY_COUNT, BLE_RETRY_INTERVAL_SEC
+from .config import BLE_CONNECT_TIMEOUT_SEC, BLE_RETRY_COUNT, BLE_RETRY_INTERVAL_SEC, DEFAULT_CONNECT_ADAPTER
 from .types import (
     BLERequest, ReadRequest, ScanRequest, WriteRequest, RequestStatus, 
     NotificationRequest
@@ -19,6 +19,8 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+# BLE操作の排他制御用グローバルロック（scanner.pyと同じ）
+_ble_operation_lock = asyncio.Lock()
 
 class BLERequestHandler:
     """
@@ -185,34 +187,36 @@ class BLERequestHandler:
             raise ValueError(f"Device {request.mac_address} not found")
 
         async with self._connection_lock:
-            for retry in range(BLE_RETRY_COUNT):
-                try:
-                    logger.debug(
-                        f"Connecting to {device} to read characteristic "
-                        f"{request.characteristic_uuid} (attempt {retry+1}/{BLE_RETRY_COUNT})"
-                    )
-                    
-                    async with BleakClient(device.address, timeout=BLE_CONNECT_TIMEOUT_SEC, adapter="hci1") as client:
-                        logger.debug(f"Connected to {device}")
-                        
-                        value = await client.read_gatt_char(request.characteristic_uuid)
-                        request.response_data = value
-                        request.status = RequestStatus.COMPLETED
-                        
-                        logger.info(
-                            f"Successfully read characteristic {request.characteristic_uuid} "
-                            f"from {device}: {value.hex() if value else 'None'}"
+            # BLE操作の排他制御
+            async with _ble_operation_lock:
+                for retry in range(BLE_RETRY_COUNT):
+                    try:
+                        logger.debug(
+                            f"Connecting to {device} to read characteristic "
+                            f"{request.characteristic_uuid} (attempt {retry+1}/{BLE_RETRY_COUNT})"
                         )
-                        return
                         
-                except (BleakError, asyncio.TimeoutError) as e:
-                    logger.warning(
-                        f"Failed to read from {device} (attempt {retry+1}): {e}"
-                    )
-                    if retry < BLE_RETRY_COUNT - 1:
-                        await asyncio.sleep(BLE_RETRY_INTERVAL_SEC)
-                    else:
-                        raise BleakError(f"Failed to read after {BLE_RETRY_COUNT} attempts: {e}")
+                        async with BleakClient(device.address, timeout=BLE_CONNECT_TIMEOUT_SEC, adapter=DEFAULT_CONNECT_ADAPTER) as client:
+                            logger.debug(f"Connected to {device}")
+                            
+                            value = await client.read_gatt_char(request.characteristic_uuid)
+                            request.response_data = value
+                            request.status = RequestStatus.COMPLETED
+                            
+                            logger.info(
+                                f"Successfully read characteristic {request.characteristic_uuid} "
+                                f"from {device}: {value.hex() if value else 'None'}"
+                            )
+                            return
+                            
+                    except (BleakError, asyncio.TimeoutError) as e:
+                        logger.warning(
+                            f"Failed to read from {device} (attempt {retry+1}): {e}"
+                        )
+                        if retry < BLE_RETRY_COUNT - 1:
+                            await asyncio.sleep(BLE_RETRY_INTERVAL_SEC)
+                        else:
+                            raise BleakError(f"Failed to read after {BLE_RETRY_COUNT} attempts: {e}")
 
     async def _handle_write_request(self, request: WriteRequest) -> None:
         """
@@ -223,48 +227,50 @@ class BLERequestHandler:
             raise ValueError(f"Device {request.mac_address} not found")
 
         async with self._connection_lock:
-            for retry in range(BLE_RETRY_COUNT):
-                try:
-                    logger.debug(
-                        f"Connecting to {device.address} to write characteristic "
-                        f"{request.characteristic_uuid} (attempt {retry+1}/{BLE_RETRY_COUNT})"
-                    )
-                    
-                    async with BleakClient(device.address, timeout=BLE_CONNECT_TIMEOUT_SEC, adapter="hci1") as client:
-                        logger.debug(f"Connected to {device.address}")
-                        
-                        await client.write_gatt_char(
-                            request.characteristic_uuid, 
-                            request.data,
-                            response=request.response_required
+            # BLE操作の排他制御
+            async with _ble_operation_lock:
+                for retry in range(BLE_RETRY_COUNT):
+                    try:
+                        logger.debug(
+                            f"Connecting to {device.address} to write characteristic "
+                            f"{request.characteristic_uuid} (attempt {retry+1}/{BLE_RETRY_COUNT})"
                         )
                         
-                        # レスポンスが必要な場合は読み取り
-                        if request.response_required:
-                            response = await client.read_gatt_char(request.characteristic_uuid)
-                            request.response_data = response
-                            logger.debug(f"Response received: {response.hex() if response else 'None'}")
+                        async with BleakClient(device.address, timeout=BLE_CONNECT_TIMEOUT_SEC, adapter=DEFAULT_CONNECT_ADAPTER) as client:
+                            logger.debug(f"Connected to {device.address}")
+                            
+                            await client.write_gatt_char(
+                                request.characteristic_uuid, 
+                                request.data,
+                                response=request.response_required
+                            )
+                            
+                            # レスポンスが必要な場合は読み取り
+                            if request.response_required:
+                                response = await client.read_gatt_char(request.characteristic_uuid)
+                                request.response_data = response
+                                logger.debug(f"Response received: {response.hex() if response else 'None'}")
+                            else:
+                                logger.debug(f"Response not required")
+                                request.response_data = {}
+                            
+                            # リクエスト完了
+                            request.status = RequestStatus.COMPLETED
+                            
+                            logger.info(
+                                f"Successfully wrote to characteristic {request.characteristic_uuid} "
+                                f"on {device.address}: {request.data.hex() if request.data else 'None'}"
+                            )
+                            return
+                            
+                    except (BleakError, asyncio.TimeoutError) as e:
+                        logger.warning(
+                            f"Failed to write to {device.address} (attempt {retry+1}): {e}"
+                        )
+                        if retry < BLE_RETRY_COUNT - 1:
+                            await asyncio.sleep(BLE_RETRY_INTERVAL_SEC)
                         else:
-                            logger.debug(f"Response not required")
-                            request.response_data = {}
-                        
-                        # リクエスト完了
-                        request.status = RequestStatus.COMPLETED
-                        
-                        logger.info(
-                            f"Successfully wrote to characteristic {request.characteristic_uuid} "
-                            f"on {device.address}: {request.data.hex() if request.data else 'None'}"
-                        )
-                        return
-                        
-                except (BleakError, asyncio.TimeoutError) as e:
-                    logger.warning(
-                        f"Failed to write to {device.address} (attempt {retry+1}): {e}"
-                    )
-                    if retry < BLE_RETRY_COUNT - 1:
-                        await asyncio.sleep(BLE_RETRY_INTERVAL_SEC)
-                    else:
-                        raise BleakError(f"Failed to write after {BLE_RETRY_COUNT} attempts: {e}")
+                            raise BleakError(f"Failed to write after {BLE_RETRY_COUNT} attempts: {e}")
 
     async def _get_device(self, mac_address: str) -> Optional[Union[BLEDevice, str]]:
         """

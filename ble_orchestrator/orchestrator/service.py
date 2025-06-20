@@ -12,7 +12,7 @@ import uuid
 
 from bleak.backends.device import BLEDevice
 
-from .config import LOG_DIR, LOG_FILE, DEFAULT_REQUEST_TIMEOUT_SEC
+from .config import LOG_DIR, LOG_FILE, DEFAULT_REQUEST_TIMEOUT_SEC, BLE_ADAPTERS
 from .handler import BLERequestHandler
 from .ipc_server import IPCServer
 from .queue_manager import RequestQueueManager
@@ -54,7 +54,8 @@ class BLEOrchestratorService:
         # ウォッチドッグ
         self.watchdog = BLEWatchdog(
             self.handler.get_consecutive_failures,
-            self.handler.reset_failure_count
+            self.handler.reset_failure_count,
+            adapters=BLE_ADAPTERS
         )
         
         # スキャナー（ウォッチドッグ通知機能付き）
@@ -70,7 +71,8 @@ class BLEOrchestratorService:
         self.ipc_server = IPCServer(
             self._get_scan_result,
             self._enqueue_request,
-            self._get_service_status
+            self._get_service_status,
+            queue_manager=self.queue_manager
         )
         
         logger.info("BLE Orchestrator service initialized")

@@ -21,11 +21,17 @@ BLE_CONNECT_TIMEOUT_SEC = 10.0  # 接続タイムアウト（秒）
 BLE_RETRY_COUNT = 3  # 接続リトライ回数
 BLE_RETRY_INTERVAL_SEC = 1.0  # リトライ間隔（秒）
 
+# BLEアダプタ設定
+BLE_ADAPTERS = ["hci0", "hci1"]  # 使用するBLEアダプタのリスト
+DEFAULT_SCAN_ADAPTER = "hci0"  # スキャン用のデフォルトアダプタ
+DEFAULT_CONNECT_ADAPTER = "hci1"  # 接続用のデフォルトアダプタ
+
 # ハング検出・復旧設定
 WATCHDOG_CHECK_INTERVAL_SEC = 30.0  # ウォッチドッグ確認間隔（秒）
 CONSECUTIVE_FAILURES_THRESHOLD = 3  # 連続失敗しきい値
 ADAPTER_RESET_COMMAND = "hciconfig {adapter} reset"  # アダプタリセットコマンド
 BLUETOOTH_RESTART_COMMAND = "systemctl restart bluetooth"  # Bluetooth再起動コマンド
+ADAPTER_STATUS_COMMAND = "hciconfig {adapter}"  # アダプタ状態確認コマンド
 
 # IPCサーバー設定
 IPC_SOCKET_PATH = os.environ.get(
@@ -37,4 +43,8 @@ IPC_LISTEN_PORT = int(os.environ.get("BLE_ORCHESTRATOR_PORT", "8378"))  # BLE on
 IPC_MAX_CONNECTIONS = 10
 
 # リクエストのデフォルトタイムアウト (秒)
-DEFAULT_REQUEST_TIMEOUT_SEC = 10.0 
+DEFAULT_REQUEST_TIMEOUT_SEC = 10.0
+
+# リクエストキュー設定
+REQUEST_MAX_AGE_SEC = 60.0  # リクエストの最大待機時間（秒）
+SKIP_OLD_REQUESTS = True  # 古いリクエストのスキップ機能の有効/無効 

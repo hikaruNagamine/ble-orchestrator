@@ -27,7 +27,7 @@ def watchdog(mock_get_failures, mock_reset_failures):
     return BLEWatchdog(
         get_failures_func=mock_get_failures,
         reset_failures_func=mock_reset_failures,
-        adapter_name="hci0"
+        adapters=["hci0", "hci1"]
     )
 
 

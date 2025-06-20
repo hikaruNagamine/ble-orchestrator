@@ -36,16 +36,19 @@ class IPCServer:
         handle_scan_func: Callable[[str], Optional[ScanResult]],
         enqueue_request_func: Callable[[BLERequest], Any],
         get_status_func: Callable[[], Dict[str, Any]],
+        queue_manager=None,  # キューマネージャーへの参照（設定変更用）
     ):
         """
         初期化
         handle_scan_func: スキャン結果を取得する関数
         enqueue_request_func: BLEリクエストをキューに入れる関数
         get_status_func: サービスステータスを取得する関数
+        queue_manager: キューマネージャーへの参照（設定変更用）
         """
         self._handle_scan_func = handle_scan_func
         self._enqueue_request_func = enqueue_request_func
         self._get_status_func = get_status_func
+        self._queue_manager = queue_manager
         self._server = None
         self._stop_event = asyncio.Event()
         self._task = None
@@ -231,7 +234,8 @@ class IPCServer:
             # サービスステータス取得
             return {
                 "status": "success",
-                "data": self._get_status_func()
+                "data": self._get_status_func(),
+                "request_id": request.get("request_id")
             }
             
         if command == "get_scan_result" or command == "get_scan_data":
@@ -300,12 +304,14 @@ class IPCServer:
             if result:
                 return {
                     "status": "success",
-                    "data": result.to_dict()
+                    "data": result.to_dict(),
+                    "request_id": request.get("request_id")
                 }
             else:
                 return {
                     "status": "error",
-                    "error": f"Device {mac_address} not found or scan data expired"
+                    "error": f"Device {mac_address} not found or scan data expired",
+                    "request_id": request.get("request_id")
                 }
                 
         elif command == "read_sensor":
@@ -472,11 +478,98 @@ class IPCServer:
                 "message": f"Notification {'unsubscribed' if unsubscribe else 'subscribed'} successfully"
             }
             
+        elif command == "get_queue_config":
+            # キューの設定を取得
+            if self._queue_manager is None:
+                return {
+                    "status": "error",
+                    "error": "Queue manager not available",
+                    "request_id": request.get("request_id")
+                }
+            
+            config = self._queue_manager.get_skip_old_requests_config()
+            return {
+                "status": "success",
+                "data": config,
+                "request_id": request.get("request_id")
+            }
+            
+        elif command == "get_queue_status":
+            # キューの詳細な状態を取得
+            if self._queue_manager is None:
+                return {
+                    "status": "error",
+                    "error": "Queue manager not available",
+                    "request_id": request.get("request_id")
+                }
+            
+            status = self._queue_manager.get_queue_status()
+            return {
+                "status": "success",
+                "data": status,
+                "request_id": request.get("request_id")
+            }
+            
+        elif command == "get_queue_stats":
+            # キューの統計情報を取得
+            if self._queue_manager is None:
+                return {
+                    "status": "error",
+                    "error": "Queue manager not available",
+                    "request_id": request.get("request_id")
+                }
+            
+            stats = self._queue_manager.get_queue_stats()
+            return {
+                "status": "success",
+                "data": stats,
+                "request_id": request.get("request_id")
+            }
+            
+        elif command == "update_queue_config":
+            # キューの設定を更新
+            if self._queue_manager is None:
+                return {
+                    "status": "error",
+                    "error": "Queue manager not available",
+                    "request_id": request.get("request_id")
+                }
+            
+            skip_old_requests = request.get("skip_old_requests")
+            max_age_sec = request.get("max_age_sec")
+            
+            if skip_old_requests is None:
+                return {
+                    "status": "error",
+                    "error": "Missing skip_old_requests parameter",
+                    "request_id": request.get("request_id")
+                }
+            
+            try:
+                self._queue_manager.update_skip_old_requests_config(
+                    skip_old_requests=bool(skip_old_requests),
+                    max_age_sec=float(max_age_sec) if max_age_sec is not None else None
+                )
+                
+                return {
+                    "status": "success",
+                    "message": "Queue configuration updated successfully",
+                    "data": self._queue_manager.get_skip_old_requests_config(),
+                    "request_id": request.get("request_id")
+                }
+            except (ValueError, TypeError) as e:
+                return {
+                    "status": "error",
+                    "error": f"Invalid parameter value: {e}",
+                    "request_id": request.get("request_id")
+                }
+            
         else:
             # 不明なコマンド
             return {
                 "status": "error",
-                "error": f"Unknown command: {command}"
+                "error": f"Unknown command: {command}",
+                "request_id": request.get("request_id")
             }
 
     async def send_notification(self, notification: NotificationData) -> None:

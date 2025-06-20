@@ -9,6 +9,7 @@ import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Callable, Any, Union
+from .config import BLE_ADAPTERS
 
 logger = logging.getLogger(__name__)
 
@@ -379,32 +380,60 @@ class HealthChecker:
         start_time = time.time()
         
         try:
-            # hciconfigコマンドでアダプターの状態をチェック
-            result = await self._run_command("hciconfig hci0")
+            # 各アダプタの状態をチェック
+            adapter_statuses = {}
+            healthy_adapters = []
+            problematic_adapters = []
             
-            if "UP RUNNING" in result:
+            for adapter in BLE_ADAPTERS:
+                try:
+                    result = await self._run_command(f"hciconfig {adapter}")
+                    
+                    if "UP RUNNING" in result:
+                        adapter_statuses[adapter] = "UP RUNNING"
+                        healthy_adapters.append(adapter)
+                    elif "DOWN" in result:
+                        adapter_statuses[adapter] = "DOWN"
+                        problematic_adapters.append(adapter)
+                    elif "No such device" in result:
+                        adapter_statuses[adapter] = "NOT_FOUND"
+                        problematic_adapters.append(adapter)
+                    else:
+                        adapter_statuses[adapter] = "UNKNOWN"
+                        problematic_adapters.append(adapter)
+                except Exception as e:
+                    adapter_statuses[adapter] = f"ERROR: {e}"
+                    problematic_adapters.append(adapter)
+            
+            # 全アダプタが正常な場合
+            if not problematic_adapters:
                 return ComponentHealth(
                     name="bluetooth",
                     status=HealthStatus.HEALTHY,
-                    message="Bluetooth adapter hci0 is UP and RUNNING",
+                    message=f"All Bluetooth adapters are UP and RUNNING: {healthy_adapters}",
                     last_check=time.time(),
-                    response_time_ms=(time.time() - start_time) * 1000
+                    response_time_ms=(time.time() - start_time) * 1000,
+                    details={"adapter_statuses": adapter_statuses}
                 )
-            elif "DOWN" in result:
-                return ComponentHealth(
-                    name="bluetooth",
-                    status=HealthStatus.CRITICAL,
-                    message="Bluetooth adapter hci0 is DOWN",
-                    last_check=time.time(),
-                    response_time_ms=(time.time() - start_time) * 1000
-                )
-            else:
+            # 一部のアダプタに問題がある場合
+            elif healthy_adapters:
                 return ComponentHealth(
                     name="bluetooth",
                     status=HealthStatus.WARNING,
-                    message="Bluetooth adapter status unknown",
+                    message=f"Some Bluetooth adapters have issues. Healthy: {healthy_adapters}, Problematic: {problematic_adapters}",
                     last_check=time.time(),
-                    response_time_ms=(time.time() - start_time) * 1000
+                    response_time_ms=(time.time() - start_time) * 1000,
+                    details={"adapter_statuses": adapter_statuses}
+                )
+            # 全アダプタに問題がある場合
+            else:
+                return ComponentHealth(
+                    name="bluetooth",
+                    status=HealthStatus.CRITICAL,
+                    message=f"All Bluetooth adapters have issues: {problematic_adapters}",
+                    last_check=time.time(),
+                    response_time_ms=(time.time() - start_time) * 1000,
+                    details={"adapter_statuses": adapter_statuses}
                 )
                 
         except Exception as e:
