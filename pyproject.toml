@@ -1,17 +1,64 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ble-orchestrator"
 version = "0.1.0"
 description = "BLE制御用の常駐サービス"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "BLE Orchestrator Team", email = "your-email@example.com"}
+]
+maintainers = [
+    {name = "BLE Orchestrator Team", email = "your-email@example.com"}
+]
+keywords = ["bluetooth", "ble", "orchestrator", "service", "raspberry-pi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications",
+    "Topic :: System :: Hardware",
+]
 requires-python = ">=3.9"
 dependencies = [
-    "bleak==0.22.3",
-    "dataclasses-json",
-    "aiofiles",
+    "bleak>=0.21.1,<0.23.0",
+    "dataclasses-json>=0.5.7",
+    "aiofiles>=0.8.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=22.0.0",
+    "mypy>=1.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/username/ble-orchestrator"
+Repository = "https://github.com/username/ble-orchestrator.git"
+Documentation = "https://github.com/username/ble-orchestrator#readme"
+"Bug Tracker" = "https://github.com/username/ble-orchestrator/issues"
+
+[project.scripts]
+ble-orchestrator = "ble_orchestrator.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ble_orchestrator*"]
+
+[tool.setuptools.package-data]
+"ble_orchestrator" = ["systemd/*.service"]
 
 [tool.black]
 line-length = 100

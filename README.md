@@ -54,7 +54,34 @@ graph TD
 
 ### セットアップ
 
-#### 標準的なインストール方法
+#### 推奨: 仮想環境を使用したインストール
+
+Raspberry Pi OS（Bullseye以降）では、システム管理環境が保護されているため、仮想環境の使用を推奨します。
+
+##### 簡易インストール（推奨）
+
+```bash
+# リポジトリをクローン
+git clone https://github.com/username/ble-orchestrator.git
+cd ble-orchestrator
+
+# 仮想環境を作成してインストール
+./install_venv.sh
+```
+
+##### 詳細インストール
+
+```bash
+# リポジトリをクローン
+git clone https://github.com/username/ble-orchestrator.git
+cd ble-orchestrator
+
+# 自動ビルド・インストールスクリプトを実行
+./build_and_install.sh
+# 選択肢1または2を選択（仮想環境内にインストール）
+```
+
+##### 手動インストール
 
 ```bash
 # リポジトリをクローン
@@ -67,24 +94,50 @@ source venv/bin/activate
 
 # 依存パッケージのインストール
 pip install -r requirements.txt
+
+# パッケージを開発モードでインストール
+pip install -e .
 ```
 
-#### 特定の仮想環境へのインストール
+#### システム全体へのインストール（非推奨）
 
-特定のPython仮想環境（例：`/var/temp/dynlibs/pyvenv`）にインストールする場合：
+⚠️ **警告**: システム全体にインストールすると、システムの安定性に影響を与える可能性があります。
 
 ```bash
 # リポジトリをクローン
 git clone https://github.com/username/ble-orchestrator.git
 cd ble-orchestrator
 
-# 特定の仮想環境のPythonを使用してインストール
-/var/temp/dynlibs/pyvenv/bin/pip install .
+# システム全体にインストール
+sudo pip install --break-system-packages .
 ```
 
-これにより、指定した仮想環境のPythonから`ble-orchestrator`パッケージが利用可能になります。
-
 ### systemdによる自動起動設定（Linux）
+
+#### 仮想環境を使用する場合
+
+```bash
+# systemdユニットファイルの場所とPythonパスを編集
+sed -i "s|/path/to/ble_orchestrator|$(pwd)|g" ble_orchestrator/systemd/ble-orchestrator.service
+sed -i "s|python3|$(pwd)/venv/bin/python|g" ble_orchestrator/systemd/ble-orchestrator.service
+
+# systemdにユニットファイルをコピー
+sudo cp ble_orchestrator/systemd/ble-orchestrator.service /etc/systemd/system/
+
+# systemdを再読み込み
+sudo systemctl daemon-reload
+
+# サービスを有効化
+sudo systemctl enable ble-orchestrator.service
+
+# サービスを開始
+sudo systemctl start ble-orchestrator.service
+
+# ステータス確認
+sudo systemctl status ble-orchestrator.service
+```
+
+#### システム全体にインストールした場合
 
 ```bash
 # systemdユニットファイルの場所を編集
@@ -110,10 +163,31 @@ sudo systemctl status ble-orchestrator.service
 
 ### サービスの起動
 
-手動で起動する場合は以下のコマンドを実行します：
+#### 仮想環境を使用する場合
 
 ```bash
-python -m ble_orchestrator.main
+# 仮想環境をアクティベート
+source venv/bin/activate
+
+# サービスを起動
+python -m ble_orchestrator
+```
+
+#### 直接実行
+
+```bash
+# 仮想環境をアクティベートせずに直接実行
+venv/bin/python -m ble_orchestrator
+```
+
+#### システム全体にインストールした場合
+
+```bash
+# コマンドラインから起動
+ble-orchestrator
+
+# または
+python -m ble_orchestrator
 ```
 
 ### クライアントライブラリの使用例
@@ -168,6 +242,29 @@ if __name__ == "__main__":
 | `send_command(mac, service_uuid, characteristic_uuid, data)` | PlugminiなどへBLEコマンド送信 | 優先度対応 |
 | `get_request_status(request_id)` | リクエストの処理状況を確認 | - |
 | `get_service_status()` | BLEアダプタやサービスの稼働状況 | ヘルスチェック用途 |
+
+## トラブルシューティング
+
+### よくある問題
+
+1. **externally-managed-environmentエラー**
+   ```bash
+   # 解決策: 仮想環境を使用
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install .
+   ```
+
+2. **パッケージが見つからない**
+   ```bash
+   # 仮想環境がアクティベートされているか確認
+   echo $VIRTUAL_ENV
+   
+   # パッケージ情報を確認
+   pip show ble-orchestrator
+   ```
+
+詳細なトラブルシューティングについては、[PACKAGING.md](PACKAGING.md)を参照してください。
 
 ## ライセンス
 
