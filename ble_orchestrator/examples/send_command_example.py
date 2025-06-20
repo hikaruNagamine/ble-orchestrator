@@ -31,6 +31,7 @@ async def send_command_example(mac_address, service_uuid, characteristic_uuid, d
             characteristic_uuid, 
             data,
             response_required=response_required,
+            priority="HIGH",
             timeout=60.0,
         )
         
