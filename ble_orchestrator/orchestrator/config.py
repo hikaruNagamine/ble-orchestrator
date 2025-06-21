@@ -16,7 +16,7 @@ LOG_FILE = os.path.join(LOG_DIR, "ble_orchestrator.log")
 
 # BLE設定
 SCAN_INTERVAL_SEC = 0.5  # スキャン間隔（秒）
-SCAN_CACHE_TTL_SEC = 30.0  # スキャン結果キャッシュ保持時間（秒）
+SCAN_CACHE_TTL_SEC = 120.0  # スキャン結果キャッシュ保持時間（秒）- 短時間の停止に対応
 BLE_CONNECT_TIMEOUT_SEC = 10.0  # 接続タイムアウト（秒）
 BLE_RETRY_COUNT = 3  # 接続リトライ回数
 BLE_RETRY_INTERVAL_SEC = 1.0  # リトライ間隔（秒）

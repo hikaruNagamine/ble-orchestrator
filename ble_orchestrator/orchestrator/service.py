@@ -264,15 +264,55 @@ class BLEOrchestratorService:
     def _notify_watchdog(self) -> None:
         """
         ウォッチドッグ通知機能
-        スキャナーの問題をウォッチドッグに通知
+        スキャナーの問題をウォッチドッグに通知し、復旧完了を待機
         """
         logger.info("Notifying watchdog of scanner issues")
         # 非同期メソッドを同期的なコンテキストから呼び出すためのヘルパー
         async def _async_notify():
-            await self.watchdog.notify_component_issue(
-                "scanner",
-                "Scanner detected potential Bluetooth stack issues"
-            )
+            try:
+                # ウォッチドッグに通知
+                await self.watchdog.notify_component_issue(
+                    "scanner",
+                    "Scanner detected potential Bluetooth stack issues"
+                )
+                
+                # 復旧完了を待機（タイムアウト: 60秒）
+                logger.info("Waiting for watchdog recovery completion...")
+                recovery_completed = await self.watchdog.wait_for_recovery_completion(timeout=60.0)
+                
+                if recovery_completed:
+                    logger.info("Watchdog recovery completed successfully")
+                    
+                    # Bluetoothサービスの準備完了を待機
+                    logger.info("Waiting for Bluetooth service to be ready...")
+                    service_ready = await self.watchdog.wait_for_bluetooth_service_ready(timeout=30.0)
+                    
+                    if service_ready:
+                        logger.info("Bluetooth service is ready")
+                        # サービス準備完了後、BLEアダプタの状態安定化を待機
+                        await asyncio.sleep(5.0)
+                    else:
+                        logger.warning("Bluetooth service not ready, waiting for stabilization...")
+                        await asyncio.sleep(10.0)
+                else:
+                    logger.warning("Watchdog recovery timeout, checking Bluetooth service status...")
+                    # タイムアウトした場合でも、Bluetoothサービスの状態を確認
+                    service_status = await self.watchdog.check_bluetooth_service_status()
+                    logger.info(f"Bluetooth service status: {service_status}")
+                    
+                    if service_status == "active":
+                        logger.info("Bluetooth service is active, proceeding...")
+                        await asyncio.sleep(5.0)
+                    else:
+                        logger.warning("Bluetooth service not active, waiting longer...")
+                        await asyncio.sleep(15.0)
+                
+                logger.info("Watchdog recovery wait completed")
+                
+            except Exception as e:
+                logger.error(f"Error in watchdog notification: {e}")
+                # エラーが発生した場合でも、BLEアダプタの状態安定化を待機
+                await asyncio.sleep(15.0)
             
         # 非同期通知をイベントループで実行
         asyncio.create_task(_async_notify())

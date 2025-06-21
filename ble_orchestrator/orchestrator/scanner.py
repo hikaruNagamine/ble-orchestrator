@@ -7,7 +7,7 @@ import logging
 import time
 import subprocess
 from collections import defaultdict, deque
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any
 
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
@@ -36,6 +36,8 @@ class ScanCache:
         self._cache: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
         self._ttl_seconds = ttl_seconds
         self._lock = asyncio.Lock()
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 300  # 5分ごとにクリーンアップ
 
     async def add_result(self, device: BLEDevice, adv_data: AdvertisementData) -> None:
         """
@@ -60,29 +62,66 @@ class ScanCache:
 
         async with self._lock:
             self._cache[device.address].append(result)
+            
+            # 定期的なクリーンアップを実行
+            await self._cleanup_expired_entries()
         
         # logger.debug(f"Added scan result for {device.address} ({device.name}), RSSI: {adv_data.rssi}")
+
+    async def _cleanup_expired_entries(self) -> None:
+        """
+        期限切れのエントリを定期的にクリーンアップ
+        """
+        current_time = time.time()
+        
+        # クリーンアップ間隔をチェック
+        if current_time - self._last_cleanup < self._cleanup_interval:
+            return
+            
+        self._last_cleanup = current_time
+        
+        # 期限切れのデバイスを特定
+        expired_devices = []
+        for address, results in self._cache.items():
+            if not results:
+                # 空のdequeは削除対象
+                expired_devices.append(address)
+                continue
+                
+            # 最新の結果が期限切れかチェック
+            latest_result = results[-1]
+            if current_time - latest_result.timestamp > self._ttl_seconds:
+                expired_devices.append(address)
+        
+        # 期限切れのデバイスを削除
+        for address in expired_devices:
+            del self._cache[address]
+            
+        if expired_devices and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Cleaned up {len(expired_devices)} expired device entries")
 
     def get_latest_result(self, address: str) -> Optional[ScanResult]:
         """
         指定MACアドレスの最新のスキャン結果を取得
         TTL切れの場合はNoneを返す
         """
-        logger.debug(f"get_latest_result: {address}")
-        # logger.debug(f"self._cache: {self._cache}")
-        logger.debug(f"self._cache[address]: {self._cache[address]}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Getting latest scan result for {address}")
+            
         if address not in self._cache or not self._cache[address]:
-            logger.debug(f"get_latest_result: {address} not in self._cache or not self._cache[address]")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"No cached results found for {address}")
             return None
         
         latest_result = self._cache[address][-1]
-        logger.debug(f"latest_result: {latest_result}")
-        logger.debug(f"latest_result.timestamp: {latest_result.timestamp}")
-        logger.debug(f"latest_result type: {type(latest_result)}")
+        
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Latest result timestamp: {latest_result.timestamp}")
         
         # TTLチェック
         if time.time() - latest_result.timestamp > self._ttl_seconds:
-            logger.debug(f"Scan result for {address} is expired")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Scan result for {address} is expired")
             return None
             
         return latest_result
@@ -100,6 +139,20 @@ class ScanCache:
                 active_devices.append(address)
                 
         return active_devices
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """
+        キャッシュの統計情報を取得
+        """
+        total_devices = len(self._cache)
+        total_results = sum(len(results) for results in self._cache.values())
+        
+        return {
+            "total_devices": total_devices,
+            "total_results": total_results,
+            "last_cleanup": self._last_cleanup,
+            "cleanup_interval": self._cleanup_interval
+        }
 
 
 class BLEScanner:
@@ -124,30 +177,116 @@ class BLEScanner:
         self._notify_watchdog_func = notify_watchdog_func
         self._last_recreate_time = 0
         self._recovery_in_progress = False
-        self._recreate_lock = asyncio.Lock()  # 再作成処理の排他制御用
+        self._recreate_lock = asyncio.Lock()  # スキャナー再作成と停止処理の排他制御用
 
     async def _detection_callback(self, device: BLEDevice, adv_data: AdvertisementData) -> None:
         """
         スキャン結果のコールバック
         """
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Detection callback called for device: {device.address} ({device.name}), RSSI: {adv_data.rssi}")
+        
         self._last_scan_time = time.time()
         await self.cache.add_result(device, adv_data)
+
+    async def _should_skip_recreation(self) -> bool:
+        """
+        スキャナー再作成をスキップすべきかチェック
+        """
+        # 既に復旧処理中の場合は何もしない
+        if self._recovery_in_progress:
+            logger.info("Recovery already in progress, skipping scanner recreation")
+            return True
+            
+        # 最小再作成間隔をチェック
+        current_time = time.time()
+        if current_time - self._last_recreate_time < MIN_SCANNER_RECREATE_INTERVAL:
+            logger.info("Skipping scanner recreation due to minimum interval restriction")
+            return True
+            
+        return False
+
+    async def _stop_current_scanner(self) -> None:
+        """
+        現在のスキャナーを安全に停止
+        """
+        if not self._scanner_active:
+            return
+            
+        try:
+            logger.debug("Stopping scanner")
+            # タイムアウト付きでスキャナー停止を試行
+            await asyncio.wait_for(self.scanner.stop(), timeout=5.0)
+            logger.debug("Scanner stopped successfully")
+        except asyncio.TimeoutError:
+            logger.warning("Timeout while stopping scanner, forcing stop")
+        except Exception as e:
+            error_msg = str(e)
+            if "InProgress" in error_msg:
+                logger.info("Scanner stop already in progress, waiting for completion")
+                # InProgressエラーの場合は少し待機してから状態をクリア
+                await asyncio.sleep(0.5)
+            else:
+                logger.warning(f"Error stopping scanner: {e}")
+        finally:
+            self._scanner_active = False  # スキャン状態フラグをクリア
+
+    async def _notify_watchdog_if_needed(self) -> None:
+        """
+        必要に応じてウォッチドッグに通知
+        """
+            
+        logger.warning("Multiple scanner recreations required, notifying watchdog")
+        if self._notify_watchdog_func:
+            try:
+                # ウォッチドッグに通知（service.pyの改善された機能を使用）
+                self._notify_watchdog_func()
+                logger.info("Watchdog notification sent")
+                
+            except Exception as e:
+                logger.error(f"Failed to notify watchdog: {e}")
+        
+        self._recreate_count = 0
+
+    async def _create_new_scanner(self) -> None:
+        """
+        新しいスキャナーを作成して開始
+        """
+        logger.info("Creating new BleakScanner instance")
+        
+        # 新しいスキャナーを作成
+        self.scanner = BleakScanner(
+            adapter=DEFAULT_SCAN_ADAPTER,
+            detection_callback=self._detection_callback
+        )
+        
+        logger.info("Starting new scanner")
+        # スキャンを再開
+        await self.scanner.start()
+        self._scanner_active = True  # スキャン状態フラグを設定
+        self._last_scan_time = time.time()
+        self._no_devices_count = 0
+        logger.info("Scanner recreated successfully")
+        logger.debug(f"Scanner active: {self._scanner_active}, last scan time: {self._last_scan_time}")
+
+    async def _update_recreation_stats(self) -> None:
+        """
+        再作成統計情報を更新
+        """
+        current_time = time.time()
+        self._recreate_count += 1
+        self._last_recreate_time = current_time
 
     async def _recreate_scanner(self) -> None:
         """
         スキャナーを完全に再作成
+        _recreate_lockにより、stop()メソッドとの競合を防ぐ
         """
-        # Lockを使用して同時実行を防ぐ
+        # スキャナー再作成と停止処理の排他制御
+        # これにより、再作成中にstop()が呼ばれても安全に処理できる
         async with self._recreate_lock:
-            # 既に復旧処理中の場合は何もしない
-            if self._recovery_in_progress:
-                logger.info("Recovery already in progress, skipping scanner recreation")
-                return
-                
-            # 最小再作成間隔をチェック
-            current_time = time.time()
-            if current_time - self._last_recreate_time < MIN_SCANNER_RECREATE_INTERVAL:
-                logger.info("Skipping scanner recreation due to minimum interval restriction")
+            # 事前チェック
+            if await self._should_skip_recreation():
                 return
                 
             self._recovery_in_progress = True
@@ -157,58 +296,21 @@ class BLEScanner:
             async with _ble_operation_lock:
                 try:
                     # 現在のスキャナーを停止
-                    # 独自のスキャン状態フラグを使用してスキャン状態を確認
-                    if self._scanner_active:
-                        try:
-                            logger.debug("Stopping scanner")
-                            # タイムアウト付きでスキャナー停止を試行
-                            await asyncio.wait_for(self.scanner.stop(), timeout=5.0)
-                            logger.debug("Scanner stopped successfully")
-                        except asyncio.TimeoutError:
-                            logger.warning("Timeout while stopping scanner, forcing stop")
-                        except Exception as e:
-                            error_msg = str(e)
-                            if "InProgress" in error_msg:
-                                logger.info("Scanner stop already in progress, waiting for completion")
-                                # InProgressエラーの場合は少し待機してから状態をクリア
-                                await asyncio.sleep(0.5)
-                            else:
-                                logger.warning(f"Error stopping scanner: {e}")
-                        finally:
-                            self._scanner_active = False  # スキャン状態フラグをクリア
+                    await self._stop_current_scanner()
                     
                     await asyncio.sleep(1.0)
                     
-                    # 再作成回数をカウント
-                    self._recreate_count += 1
-                    self._last_recreate_time = current_time
+                    # 再作成統計情報を更新
+                    await self._update_recreation_stats()
                     
-                    # 3回連続で再作成が必要な場合はウォッチドッグに通知
-                    if self._recreate_count >= 3:
-                        logger.warning("Multiple scanner recreations required, notifying watchdog")
-                        if self._notify_watchdog_func:
-                            try:
-                                self._notify_watchdog_func()
-                                logger.info("Watchdog notified of scanner issues")
-                                # ウォッチドッグに任せて、しばらく再作成を試みない
-                                await asyncio.sleep(60)  # ウォッチドッグの処理を待つ
-                            except Exception as e:
-                                logger.error(f"Failed to notify watchdog: {e}")
-                        self._recreate_count = 0
-                        return
+                    # ウォッチドッグ通知が必要な場合は処理を終了
+                    await self._notify_watchdog_if_needed()
                     
                     # 新しいスキャナーを作成
-                    self.scanner = BleakScanner(
-                        adapter=DEFAULT_SCAN_ADAPTER,
-                        detection_callback=self._detection_callback
-                    )
+                    await self._create_new_scanner()
                     
-                    # スキャンを再開
-                    await self.scanner.start()
-                    self._scanner_active = True  # スキャン状態フラグを設定
-                    self._last_scan_time = time.time()
-                    self._no_devices_count = 0
-                    logger.info("Scanner recreated successfully")
+                    # 再作成後の状態をログ出力
+                    logger.info("Scanner recreation completed, monitoring for detection callbacks")
                     
                 except Exception as e:
                     logger.error(f"Failed to recreate scanner: {e}")
@@ -216,6 +318,45 @@ class BLEScanner:
                     raise
                 finally:
                     self._recovery_in_progress = False
+
+    def _check_recreation_needed(self) -> tuple[bool, str]:
+        """
+        スキャナー再作成が必要かどうかを判定
+        返り値: (再作成が必要か, 理由)
+        """
+        # 定期的にアクティブデバイス数をログ出力
+        active_devices = self.cache.get_all_devices()
+        active_count = len(active_devices)
+        current_time = time.time()
+        time_since_last_scan = current_time - self._last_scan_time
+        
+        logger.debug(f"Active BLE devices: {active_count}, time since last scan: {time_since_last_scan:.1f}s")
+        
+        # デバイス数が0の場合の処理
+        if active_count == 0:
+            self._no_devices_count += 1
+            logger.debug(f"No devices detected, count: {self._no_devices_count}/{NO_DEVICES_THRESHOLD}")
+            
+            # NO_DEVICES_THRESHOLD秒以上デバイスが検出されない場合
+            if self._no_devices_count >= NO_DEVICES_THRESHOLD:
+                logger.warning(f"Recreation needed: No devices detected for {NO_DEVICES_THRESHOLD} seconds")
+                return True, f"No devices detected for {NO_DEVICES_THRESHOLD} seconds"
+        else:
+            if self._no_devices_count > 0:
+                logger.info(f"Devices detected again, resetting no_devices_count from {self._no_devices_count} to 0")
+            self._no_devices_count = 0
+            self._last_device_count = active_count
+            # デバイスが検出された場合は再作成カウントをリセット
+            if self._recreate_count > 0:
+                logger.info("Devices detected, resetting recreation count")
+                self._recreate_count = 0
+        
+        # 最後のスキャンから一定時間経過している場合（デバイス検出条件と重複しない場合のみ）
+        if time_since_last_scan > NO_DEVICES_THRESHOLD:
+            logger.warning(f"Recreation needed: No scan results for {NO_DEVICES_THRESHOLD} seconds (last scan: {time_since_last_scan:.1f}s ago)")
+            return True, f"No scan results for {NO_DEVICES_THRESHOLD} seconds (last scan: {time_since_last_scan:.1f}s ago)"
+        
+        return False, ""
 
     async def _scan_loop(self) -> None:
         """
@@ -226,35 +367,8 @@ class BLEScanner:
                 # スキャナーはコールバック方式なので、待機するだけ
                 await asyncio.sleep(SCAN_INTERVAL_SEC)
                 
-                # 定期的にアクティブデバイス数をログ出力
-                active_devices = self.cache.get_all_devices()
-                active_count = len(active_devices)
-                logger.debug(f"Active BLE devices: {active_count}")
-                
                 # スキャナー再作成が必要かどうかを判定
-                need_recreation = False
-                recreation_reason = ""
-                
-                # デバイス数が0の場合の処理
-                if active_count == 0:
-                    self._no_devices_count += 1
-                    
-                    # NO_DEVICES_THRESHOLD秒以上デバイスが検出されない場合
-                    if self._no_devices_count >= NO_DEVICES_THRESHOLD:
-                        need_recreation = True
-                        recreation_reason = f"No devices detected for {NO_DEVICES_THRESHOLD} seconds"
-                else:
-                    self._no_devices_count = 0
-                    self._last_device_count = active_count
-                    # デバイスが検出された場合は再作成カウントをリセット
-                    if self._recreate_count > 0:
-                        logger.info("Devices detected, resetting recreation count")
-                        self._recreate_count = 0
-                
-                # 最後のスキャンから一定時間経過している場合（デバイス検出条件と重複しない場合のみ）
-                if not need_recreation and time.time() - self._last_scan_time > NO_DEVICES_THRESHOLD:
-                    need_recreation = True
-                    recreation_reason = f"No scan results for {NO_DEVICES_THRESHOLD} seconds"
+                need_recreation, recreation_reason = self._check_recreation_needed()
                 
                 # スキャナー再作成が必要な場合、一度だけ実行
                 if need_recreation:
@@ -318,31 +432,36 @@ class BLEScanner:
                 logger.error(f"Error cancelling scanner task: {e}")
             
             # _recreate_scannerとの競合を防ぐため、Lockを使用
+            # これにより、再作成中に停止処理が呼ばれても安全に処理できる
             async with self._recreate_lock:
                 # BLE操作の排他制御
                 async with _ble_operation_lock:
                     try:
-                        # 独自のスキャン状態フラグを使用してスキャン状態を確認
-                        if self._scanner_active:
-                            try:
-                                # タイムアウト付きでスキャナー停止を試行
-                                await asyncio.wait_for(self.scanner.stop(), timeout=5.0)
-                                logger.debug("Scanner stopped successfully")
-                            except asyncio.TimeoutError:
-                                logger.warning("Timeout while stopping scanner, forcing stop")
-                            except Exception as stop_error:
-                                error_msg = str(stop_error)
-                                if "InProgress" in error_msg:
-                                    logger.info("Scanner stop already in progress, waiting for completion")
-                                    # InProgressエラーの場合は少し待機してから状態をクリア
-                                    await asyncio.sleep(0.5)
-                                else:
-                                    logger.warning(f"Error stopping scanner: {stop_error}")
-                            finally:
-                                self._scanner_active = False  # スキャン状態フラグをクリア
+                        # 既存のメソッドを再利用してスキャナーを停止
+                        await self._stop_current_scanner()
                     except Exception as e:
                         logger.error(f"Error while stopping scanner: {e}")
                         self._scanner_active = False  # エラーが発生した場合もフラグをクリア
                 
         self.is_running = False
-        logger.info("BLE scanner stopped") 
+        logger.info("BLE scanner stopped")
+
+    def get_scanner_status(self) -> Dict[str, Any]:
+        """
+        スキャナーの詳細な状態を取得
+        """
+        current_time = time.time()
+        time_since_last_scan = current_time - self._last_scan_time
+        
+        return {
+            "is_running": self.is_running,
+            "scanner_active": self._scanner_active,
+            "recovery_in_progress": self._recovery_in_progress,
+            "last_scan_time": self._last_scan_time,
+            "time_since_last_scan": time_since_last_scan,
+            "no_devices_count": self._no_devices_count,
+            "recreate_count": self._recreate_count,
+            "last_device_count": self._last_device_count,
+            "active_devices": len(self.cache.get_all_devices()),
+            "cache_stats": self.cache.get_cache_stats()
+        } 

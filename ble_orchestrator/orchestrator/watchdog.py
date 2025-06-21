@@ -46,6 +46,8 @@ class BLEWatchdog:
         self._start_time = time.time()
         self._component_issues = {}  # コンポーネントごとの問題を追跡
         self._adapter_status = {}  # 各アダプタの状態を追跡
+        self._recovery_completion_event = asyncio.Event()  # 復旧完了通知用
+        self._recovery_callbacks = []  # 復旧完了時のコールバック関数リスト
 
     async def notify_component_issue(self, component_name: str, issue_description: str) -> None:
         """
@@ -65,6 +67,80 @@ class BLEWatchdog:
         if not self._recovery_in_progress:
             logger.info(f"Starting recovery process due to {component_name} issue")
             asyncio.create_task(self._recover_ble_adapter())
+
+    def add_recovery_completion_callback(self, callback: Callable[[], None]) -> None:
+        """
+        復旧完了時のコールバック関数を追加
+        """
+        self._recovery_callbacks.append(callback)
+        logger.debug(f"Added recovery completion callback, total callbacks: {len(self._recovery_callbacks)}")
+
+    def remove_recovery_completion_callback(self, callback: Callable[[], None]) -> None:
+        """
+        復旧完了時のコールバック関数を削除
+        """
+        if callback in self._recovery_callbacks:
+            self._recovery_callbacks.remove(callback)
+            logger.debug(f"Removed recovery completion callback, remaining callbacks: {len(self._recovery_callbacks)}")
+
+    async def wait_for_recovery_completion(self, timeout: Optional[float] = None) -> bool:
+        """
+        復旧完了を待機
+        timeout: 待機タイムアウト（秒）、Noneの場合は無制限
+        返り値: 復旧が完了した場合はTrue、タイムアウトした場合はFalse
+        """
+        try:
+            await asyncio.wait_for(self._recovery_completion_event.wait(), timeout=timeout)
+            logger.info("Recovery completion event received")
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for recovery completion after {timeout}s")
+            return False
+
+    async def check_bluetooth_service_status(self) -> str:
+        """
+        Bluetoothサービスの状態を確認
+        返り値: サービスの状態（"active", "inactive", "failed", "unknown"）
+        """
+        try:
+            # systemctlでBluetoothサービスの状態を確認
+            result = await self._run_shell_command_with_output("systemctl is-active bluetooth")
+            
+            if result.strip() == "active":
+                return "active"
+            elif result.strip() == "inactive":
+                return "inactive"
+            elif result.strip() == "failed":
+                return "failed"
+            else:
+                return "unknown"
+        except Exception as e:
+            logger.error(f"Error checking Bluetooth service status: {e}")
+            return "unknown"
+
+    async def wait_for_bluetooth_service_ready(self, timeout: float = 30.0) -> bool:
+        """
+        Bluetoothサービスが準備完了するまで待機
+        timeout: 待機タイムアウト（秒）
+        返り値: サービスが準備完了した場合はTrue、タイムアウトした場合はFalse
+        """
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            status = await self.check_bluetooth_service_status()
+            
+            if status == "active":
+                logger.info("Bluetooth service is active and ready")
+                return True
+            elif status == "failed":
+                logger.warning("Bluetooth service is in failed state")
+                return False
+            
+            logger.debug(f"Bluetooth service status: {status}, waiting...")
+            await asyncio.sleep(2.0)
+        
+        logger.warning(f"Timeout waiting for Bluetooth service to be ready after {timeout}s")
+        return False
 
     async def start(self) -> None:
         """
@@ -221,6 +297,18 @@ class BLEWatchdog:
             logger.error(f"Error during BLE adapter recovery: {e}")
         finally:
             self._recovery_in_progress = False
+            # 復旧完了を通知
+            self._recovery_completion_event.set()
+            
+            # コールバック関数を実行
+            for callback in self._recovery_callbacks:
+                try:
+                    callback()
+                except Exception as e:
+                    logger.error(f"Error in recovery completion callback: {e}")
+            
+            # イベントをリセット（次回の復旧に備えて）
+            self._recovery_completion_event.clear()
 
     async def _check_adapter_status(self, adapter: str) -> str:
         """
