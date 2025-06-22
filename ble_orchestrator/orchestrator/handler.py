@@ -27,17 +27,22 @@ class BLERequestHandler:
     BLEリクエスト処理ハンドラー
     """
 
-    def __init__(self, get_device_func, get_scan_data_func=None):
+    def __init__(self, get_device_func, get_scan_data_func=None, scanner=None, notify_watchdog_func=None):
         """
         初期化
         get_device_func: BLEDeviceを取得する関数
         get_scan_data_func: スキャン済みデータを取得する関数
+        scanner: スキャナーインスタンス（排他制御用）
+        notify_watchdog_func: ウォッチドッグ通知関数
         """
         self._get_device_func = get_device_func
         self._get_scan_data_func = get_scan_data_func
+        self._scanner = scanner  # スキャナーインスタンス
+        self._notify_watchdog_func = notify_watchdog_func  # ウォッチドッグ通知関数
         self._connection_lock = asyncio.Lock()
         self._last_error = None
         self._consecutive_failures = 0
+        self._exclusive_control_enabled = True  # 排他制御の有効/無効フラグ
 
     async def handle_request(self, request: BLERequest) -> None:
         """
@@ -187,36 +192,65 @@ class BLERequestHandler:
             raise ValueError(f"Device {request.mac_address} not found")
 
         async with self._connection_lock:
-            # BLE操作の排他制御
-            async with _ble_operation_lock:
-                for retry in range(BLE_RETRY_COUNT):
-                    try:
-                        logger.debug(
-                            f"Connecting to {device} to read characteristic "
-                            f"{request.characteristic_uuid} (attempt {retry+1}/{BLE_RETRY_COUNT})"
-                        )
-                        
-                        async with BleakClient(device.address, timeout=BLE_CONNECT_TIMEOUT_SEC, adapter=DEFAULT_CONNECT_ADAPTER) as client:
-                            logger.debug(f"Connected to {device}")
-                            
-                            value = await client.read_gatt_char(request.characteristic_uuid)
-                            request.response_data = value
-                            request.status = RequestStatus.COMPLETED
-                            
-                            logger.info(
-                                f"Successfully read characteristic {request.characteristic_uuid} "
-                                f"from {device}: {value.hex() if value else 'None'}"
+            # 排他制御が有効でスキャナーが設定されている場合
+            if self._exclusive_control_enabled and self._scanner:
+                try:
+                    # スキャナー停止を要求
+                    self._scanner.request_scanner_stop()
+                    
+                    # スキャン停止完了を待機
+                    scan_completed_event = self._scanner.wait_for_scan_completed()
+                    await scan_completed_event.wait()
+                    scan_completed_event.clear()
+                    
+                    logger.debug("Scanner stopped for read operation")
+                except Exception as e:
+                    logger.warning(f"Failed to stop scanner for read operation: {e}")
+
+            try:
+                # BLE操作の排他制御
+                async with _ble_operation_lock:
+                    for retry in range(BLE_RETRY_COUNT):
+                        try:
+                            logger.debug(
+                                f"Connecting to {device} to read characteristic "
+                                f"{request.characteristic_uuid} (attempt {retry+1}/{BLE_RETRY_COUNT})"
                             )
-                            return
                             
-                    except (BleakError, asyncio.TimeoutError) as e:
-                        logger.warning(
-                            f"Failed to read from {device} (attempt {retry+1}): {e}"
-                        )
-                        if retry < BLE_RETRY_COUNT - 1:
-                            await asyncio.sleep(BLE_RETRY_INTERVAL_SEC)
-                        else:
-                            raise BleakError(f"Failed to read after {BLE_RETRY_COUNT} attempts: {e}")
+                            async with BleakClient(device.address, timeout=BLE_CONNECT_TIMEOUT_SEC, adapter=DEFAULT_CONNECT_ADAPTER) as client:
+                                logger.debug(f"Connected to {device}")
+                                
+                                value = await client.read_gatt_char(request.characteristic_uuid)
+                                request.response_data = value
+                                request.status = RequestStatus.COMPLETED
+                                
+                                logger.info(
+                                    f"Successfully read characteristic {request.characteristic_uuid} "
+                                    f"from {device}: {value.hex() if value else 'None'}"
+                                )
+                                return
+                                
+                        except (BleakError, asyncio.TimeoutError) as e:
+                            logger.warning(
+                                f"Failed to read from {device} (attempt {retry+1}): {e}"
+                            )
+                            if retry < BLE_RETRY_COUNT - 1:
+                                await asyncio.sleep(BLE_RETRY_INTERVAL_SEC)
+                            else:
+                                # 最終試行で失敗した場合、watchdogに通知
+                                if self._notify_watchdog_func:
+                                    logger.warning(f"BleakClient read failed after {BLE_RETRY_COUNT} attempts, notifying watchdog")
+                                    self._notify_watchdog_func()
+                                raise BleakError(f"Failed to read after {BLE_RETRY_COUNT} attempts: {e}")
+            finally:
+                # 排他制御が有効でスキャナーが設定されている場合
+                if self._exclusive_control_enabled and self._scanner:
+                    try:
+                        # クライアント処理完了を通知（成功・失敗に関係なく）
+                        self._scanner.notify_client_completed()
+                        logger.debug("Scanner can resume after read operation")
+                    except Exception as e:
+                        logger.warning(f"Failed to notify scanner completion: {e}")
 
     async def _handle_write_request(self, request: WriteRequest) -> None:
         """
@@ -227,50 +261,79 @@ class BLERequestHandler:
             raise ValueError(f"Device {request.mac_address} not found")
 
         async with self._connection_lock:
-            # BLE操作の排他制御
-            async with _ble_operation_lock:
-                for retry in range(BLE_RETRY_COUNT):
-                    try:
-                        logger.debug(
-                            f"Connecting to {device.address} to write characteristic "
-                            f"{request.characteristic_uuid} (attempt {retry+1}/{BLE_RETRY_COUNT})"
-                        )
-                        
-                        async with BleakClient(device.address, timeout=BLE_CONNECT_TIMEOUT_SEC, adapter=DEFAULT_CONNECT_ADAPTER) as client:
-                            logger.debug(f"Connected to {device.address}")
-                            
-                            await client.write_gatt_char(
-                                request.characteristic_uuid, 
-                                request.data,
-                                response=request.response_required
+            # 排他制御が有効でスキャナーが設定されている場合
+            if self._exclusive_control_enabled and self._scanner:
+                try:
+                    # スキャナー停止を要求
+                    self._scanner.request_scanner_stop()
+                    
+                    # スキャン停止完了を待機
+                    scan_completed_event = self._scanner.wait_for_scan_completed()
+                    await scan_completed_event.wait()
+                    scan_completed_event.clear()
+                    
+                    logger.debug("Scanner stopped for write operation")
+                except Exception as e:
+                    logger.warning(f"Failed to stop scanner for write operation: {e}")
+
+            try:
+                # BLE操作の排他制御
+                async with _ble_operation_lock:
+                    for retry in range(BLE_RETRY_COUNT):
+                        try:
+                            logger.debug(
+                                f"Connecting to {device.address} to write characteristic "
+                                f"{request.characteristic_uuid} (attempt {retry+1}/{BLE_RETRY_COUNT})"
                             )
                             
-                            # レスポンスが必要な場合は読み取り
-                            if request.response_required:
-                                response = await client.read_gatt_char(request.characteristic_uuid)
-                                request.response_data = response
-                                logger.debug(f"Response received: {response.hex() if response else 'None'}")
+                            async with BleakClient(device.address, timeout=BLE_CONNECT_TIMEOUT_SEC, adapter=DEFAULT_CONNECT_ADAPTER) as client:
+                                logger.debug(f"Connected to {device.address}")
+                                
+                                await client.write_gatt_char(
+                                    request.characteristic_uuid, 
+                                    request.data,
+                                    response=request.response_required
+                                )
+                                
+                                # レスポンスが必要な場合は読み取り
+                                if request.response_required:
+                                    response = await client.read_gatt_char(request.characteristic_uuid)
+                                    request.response_data = response
+                                    logger.debug(f"Response received: {response.hex() if response else 'None'}")
+                                else:
+                                    logger.debug(f"Response not required")
+                                    request.response_data = {}
+                                
+                                # リクエスト完了
+                                request.status = RequestStatus.COMPLETED
+                                
+                                logger.info(
+                                    f"Successfully wrote to characteristic {request.characteristic_uuid} "
+                                    f"on {device.address}: {request.data.hex() if request.data else 'None'}"
+                                )
+                                return
+                                
+                        except (BleakError, asyncio.TimeoutError) as e:
+                            logger.warning(
+                                f"Failed to write to {device.address} (attempt {retry+1}): {e}"
+                            )
+                            if retry < BLE_RETRY_COUNT - 1:
+                                await asyncio.sleep(BLE_RETRY_INTERVAL_SEC)
                             else:
-                                logger.debug(f"Response not required")
-                                request.response_data = {}
-                            
-                            # リクエスト完了
-                            request.status = RequestStatus.COMPLETED
-                            
-                            logger.info(
-                                f"Successfully wrote to characteristic {request.characteristic_uuid} "
-                                f"on {device.address}: {request.data.hex() if request.data else 'None'}"
-                            )
-                            return
-                            
-                    except (BleakError, asyncio.TimeoutError) as e:
-                        logger.warning(
-                            f"Failed to write to {device.address} (attempt {retry+1}): {e}"
-                        )
-                        if retry < BLE_RETRY_COUNT - 1:
-                            await asyncio.sleep(BLE_RETRY_INTERVAL_SEC)
-                        else:
-                            raise BleakError(f"Failed to write after {BLE_RETRY_COUNT} attempts: {e}")
+                                # 最終試行で失敗した場合、watchdogに通知
+                                if self._notify_watchdog_func:
+                                    logger.warning(f"BleakClient write failed after {BLE_RETRY_COUNT} attempts, notifying watchdog")
+                                    self._notify_watchdog_func()
+                                raise BleakError(f"Failed to write after {BLE_RETRY_COUNT} attempts: {e}")
+            finally:
+                # 排他制御が有効でスキャナーが設定されている場合
+                if self._exclusive_control_enabled and self._scanner:
+                    try:
+                        # クライアント処理完了を通知（成功・失敗に関係なく）
+                        self._scanner.notify_client_completed()
+                        logger.debug("Scanner can resume after write operation")
+                    except Exception as e:
+                        logger.warning(f"Failed to notify scanner completion: {e}")
 
     async def _get_device(self, mac_address: str) -> Optional[Union[BLEDevice, str]]:
         """
@@ -294,4 +357,17 @@ class BLERequestHandler:
         """
         失敗カウンタをリセット
         """
-        self._consecutive_failures = 0 
+        self._consecutive_failures = 0
+
+    def set_exclusive_control_enabled(self, enabled: bool) -> None:
+        """
+        排他制御の有効/無効を設定
+        """
+        self._exclusive_control_enabled = enabled
+        logger.info(f"Handler exclusive control {'enabled' if enabled else 'disabled'}")
+
+    def is_exclusive_control_enabled(self) -> bool:
+        """
+        排他制御が有効かどうかを確認
+        """
+        return self._exclusive_control_enabled 

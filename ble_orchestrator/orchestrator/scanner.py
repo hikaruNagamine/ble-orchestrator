@@ -26,6 +26,13 @@ NO_DEVICES_THRESHOLD = 60
 # BLE操作の排他制御用グローバルロック
 _ble_operation_lock = asyncio.Lock()
 
+# スキャナー排他制御用のグローバル変数
+_scanner_stopping = False  # スキャナー停止フラグ
+_client_connecting = False  # クライアント接続中フラグ
+_scan_ready = asyncio.Event()  # スキャン準備完了イベント
+_scan_completed = asyncio.Event()  # スキャン停止完了イベント
+_client_completed = asyncio.Event()  # クライアント完了イベント
+
 class ScanCache:
     """
     スキャン結果のキャッシュを管理するクラス
@@ -178,6 +185,9 @@ class BLEScanner:
         self._last_recreate_time = 0
         self._recovery_in_progress = False
         self._recreate_lock = asyncio.Lock()  # スキャナー再作成と停止処理の排他制御用
+        
+        # 排他制御用の状態管理
+        self._exclusive_control_enabled = True  # 排他制御の有効/無効フラグ
 
     async def _detection_callback(self, device: BLEDevice, adv_data: AdvertisementData) -> None:
         """
@@ -363,7 +373,47 @@ class BLEScanner:
         スキャンループ
         """
         try:
+            # スキャンループの開始　スキャンループの終了条件は、スキャン停止イベントが設定されている場合
             while not self._stop_event.is_set():
+                # 排他制御が有効な場合、クライアント接続要求をチェック
+                if self._exclusive_control_enabled and _scanner_stopping:
+                    logger.info("Scanner stop requested for client connection")
+                    
+                    # スキャン停止前の統計をログ出力
+                    active_devices = self.cache.get_all_devices()
+                    logger.info(f"Stopping scanner - Active devices: {len(active_devices)}")
+                    
+                    # スキャナーを停止
+                    await self._stop_current_scanner()
+                    _scan_completed.set()  # スキャン停止完了を通知
+                    
+                    # クライアント完了を待機
+                    try:
+                        await _client_completed.wait()
+                    except asyncio.CancelledError:
+                        logger.warning("Scan loop cancelled")
+                        break
+                    _client_completed.clear()  # イベントをリセット
+                    
+                    # 停止イベントが設定されている場合は終了
+                    if self._stop_event.is_set():
+                        # スキャンループの終了　
+                        logger.warning("Scan loop terminated due to stop event")
+                        break
+                    
+                    # スキャンを再開
+                    logger.info("Restarting scanner after client connection")
+                    try:
+                        await self.scanner.start()
+                        self._scanner_active = True
+                        logger.info("Scanner restarted successfully")
+                    except Exception as e:
+                        logger.error(f"Failed to restart scanner: {e}")
+                        # 再開に失敗した場合は再作成を試行
+                        await self._recreate_scanner()
+                    
+                    _scan_ready.set()  # スキャン準備完了を通知
+                
                 # スキャナーはコールバック方式なので、待機するだけ
                 await asyncio.sleep(SCAN_INTERVAL_SEC)
                 
@@ -397,16 +447,68 @@ class BLEScanner:
         self._stop_event.clear()
         logger.info("Starting BLE scanner")
         
+        # 排他制御用イベントを初期化
+        _scan_ready.clear()
+        _scan_completed.clear()
+        _client_completed.clear()
+        
         try:
             await self.scanner.start()
             self._scanner_active = True  # スキャン状態フラグを設定
             self._task = asyncio.create_task(self._scan_loop())
             logger.info("BLE scanner started successfully")
+            
+            # スキャン準備完了を通知
+            _scan_ready.set()
         except Exception as e:
             self.is_running = False
             self._scanner_active = False
             logger.error(f"Failed to start BLE scanner: {e}")
             raise
+
+    def request_scanner_stop(self) -> None:
+        """
+        クライアント接続のためにスキャナー停止を要求
+        """
+        global _scanner_stopping, _client_connecting
+        _scanner_stopping = True
+        _client_connecting = True
+        logger.info("Scanner stop requested for client connection")
+
+    def notify_client_completed(self) -> None:
+        """
+        クライアント処理完了を通知
+        """
+        global _scanner_stopping, _client_connecting
+        _client_connecting = False
+        _scanner_stopping = False
+        _client_completed.set()
+        logger.info("Client operation completed, scanner can resume")
+
+    def wait_for_scan_ready(self) -> asyncio.Event:
+        """
+        スキャン準備完了イベントを取得
+        """
+        return _scan_ready
+
+    def wait_for_scan_completed(self) -> asyncio.Event:
+        """
+        スキャン停止完了イベントを取得
+        """
+        return _scan_completed
+
+    def set_exclusive_control_enabled(self, enabled: bool) -> None:
+        """
+        排他制御の有効/無効を設定
+        """
+        self._exclusive_control_enabled = enabled
+        logger.info(f"Exclusive control {'enabled' if enabled else 'disabled'}")
+
+    def is_client_connecting(self) -> bool:
+        """
+        クライアントが接続中かどうかを確認
+        """
+        return _client_connecting
 
     async def stop(self) -> None:
         """

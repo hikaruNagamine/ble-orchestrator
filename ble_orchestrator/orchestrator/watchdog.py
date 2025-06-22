@@ -63,10 +63,16 @@ class BLEWatchdog:
             'timestamp': time.time()
         }
         
-        # 即座に復旧プロセスを開始
-        if not self._recovery_in_progress:
-            logger.info(f"Starting recovery process due to {component_name} issue")
-            asyncio.create_task(self._recover_ble_adapter())
+        # BleakClient失敗の場合は軽量なアダプタリセットのみ実行
+        if component_name == "bleakclient_failure":
+            if not self._recovery_in_progress:
+                logger.info(f"Starting lightweight adapter reset due to BleakClient failure")
+                asyncio.create_task(self._reset_adapters_only())
+        else:
+            # その他の問題の場合は通常の復旧プロセスを開始
+            if not self._recovery_in_progress:
+                logger.info(f"Starting recovery process due to {component_name} issue")
+                asyncio.create_task(self._recover_ble_adapter())
 
     def add_recovery_completion_callback(self, callback: Callable[[], None]) -> None:
         """
@@ -395,4 +401,66 @@ class BLEWatchdog:
                 
         except Exception as e:
             logger.error(f"Failed to execute command '{command}': {e}")
-            return False 
+            return False
+
+    async def _reset_adapters_only(self) -> None:
+        """
+        BleakClient失敗時の軽量なアダプタリセットのみを実行
+        Bluetoothサービス再起動は行わない
+        """
+        self._recovery_in_progress = True
+        
+        try:
+            logger.info(f"Starting lightweight adapter reset for BleakClient failure, adapters: {self._adapters}")
+            
+            # 各アダプタをリセット
+            reset_success_count = 0
+            for adapter in self._adapters:
+                logger.info(f"Resetting adapter {adapter} due to BleakClient failure")
+                success = await self._reset_single_adapter(adapter)
+                if success:
+                    logger.info(f"Successfully reset adapter {adapter}")
+                    reset_success_count += 1
+                else:
+                    logger.error(f"Failed to reset adapter {adapter}")
+            
+            # リセット後に少し待機
+            await asyncio.sleep(2.0)
+            
+            # リセット後の状態を確認
+            recovered_count = 0
+            for adapter in self._adapters:
+                status = await self._check_adapter_status(adapter)
+                self._adapter_status[adapter] = status
+                
+                if status == "UP RUNNING":
+                    recovered_count += 1
+                    logger.info(f"Adapter {adapter} recovered successfully")
+                else:
+                    logger.warning(f"Adapter {adapter} still has issues after reset: {status}")
+            
+            if recovered_count == len(self._adapters):
+                logger.info("All adapters recovered successfully after BleakClient failure")
+                self._reset_failures_func()
+            elif reset_success_count > 0:
+                logger.info(f"Partial recovery: {recovered_count}/{len(self._adapters)} adapters recovered")
+                self._reset_failures_func()
+            else:
+                logger.error("Failed to recover any adapters after BleakClient failure")
+        
+        except Exception as e:
+            logger.error(f"Error during lightweight adapter reset: {e}")
+        finally:
+            self._recovery_in_progress = False
+            # 復旧完了を通知
+            self._recovery_completion_event.set()
+            
+            # コールバック関数を実行
+            for callback in self._recovery_callbacks:
+                try:
+                    callback()
+                except Exception as e:
+                    logger.error(f"Error in recovery completion callback: {e}")
+            
+            # イベントをリセット（次回の復旧に備えて）
+            self._recovery_completion_event.clear() 

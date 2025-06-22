@@ -47,4 +47,8 @@ DEFAULT_REQUEST_TIMEOUT_SEC = 10.0
 
 # リクエストキュー設定
 REQUEST_MAX_AGE_SEC = 60.0  # リクエストの最大待機時間（秒）
-SKIP_OLD_REQUESTS = True  # 古いリクエストのスキップ機能の有効/無効 
+SKIP_OLD_REQUESTS = True  # 古いリクエストのスキップ機能の有効/無効
+
+# 排他制御設定
+EXCLUSIVE_CONTROL_ENABLED = True  # スキャナーとクライアントの排他制御の有効/無効
+EXCLUSIVE_CONTROL_TIMEOUT_SEC = 30.0  # 排他制御のタイムアウト（秒） 
