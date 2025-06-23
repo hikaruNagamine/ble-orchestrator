@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 # BLE操作の排他制御用グローバルロック（scanner.pyと同じ）
 _ble_operation_lock = asyncio.Lock()
 
+# adapter reset を待つ時間（秒）
+ADAPTER_RESET_WAIT_TIME = 5.0
+
 class BLERequestHandler:
     """
     BLEリクエスト処理ハンドラー
@@ -252,6 +255,9 @@ class BLERequestHandler:
                                 if self._notify_watchdog_func:
                                     logger.warning(f"BleakClient read failed after {BLE_RETRY_COUNT} attempts, notifying watchdog")
                                     self._notify_watchdog_func()
+                                    # adapter reset を待つ
+                                    logger.warning("Waiting for adapter reset")
+                                    await asyncio.sleep(ADAPTER_RESET_WAIT_TIME)
                                 raise BleakError(f"Failed to read after {BLE_RETRY_COUNT} attempts: {e}")
             finally:
                 # 排他制御が有効でスキャナーが設定されている場合
@@ -338,6 +344,9 @@ class BLERequestHandler:
                                 if self._notify_watchdog_func:
                                     logger.warning(f"BleakClient write failed after {BLE_RETRY_COUNT} attempts, notifying watchdog")
                                     self._notify_watchdog_func()
+                                    # adapter reset を待つ
+                                    logger.warning("Waiting for adapter reset")
+                                    await asyncio.sleep(ADAPTER_RESET_WAIT_TIME)
                                 raise BleakError(f"Failed to write after {BLE_RETRY_COUNT} attempts: {e}")
             finally:
                 # 排他制御が有効でスキャナーが設定されている場合

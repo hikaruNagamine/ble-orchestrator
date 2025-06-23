@@ -21,7 +21,13 @@ logger = logging.getLogger(__name__)
 # スキャナー再作成の最小間隔（秒）
 MIN_SCANNER_RECREATE_INTERVAL = 180  # 3分
 # デバイス未検出の許容時間（秒）
-NO_DEVICES_THRESHOLD = 60
+NO_DEVICES_THRESHOLD = 90
+# クライアント完了待機のタイムアウト（秒）
+CLIENT_COMPLETION_TIMEOUT = 60.0
+# スキャナー開始のタイムアウト（秒）
+SCANNER_START_TIMEOUT = 5.0
+# スキャナー停止のタイムアウト（秒）
+SCANNER_STOP_TIMEOUT = 5.0
 
 # BLE操作の排他制御用グローバルロック
 _ble_operation_lock = asyncio.Lock()
@@ -267,14 +273,14 @@ class BLEScanner:
         try:
             logger.debug("Stopping scanner")
             # タイムアウト付きでスキャナー停止を試行
-            await asyncio.wait_for(self.scanner.stop(), timeout=5.0)
+            await asyncio.wait_for(self.scanner.stop(), timeout=SCANNER_STOP_TIMEOUT)
             logger.debug("Scanner stopped successfully")
         except asyncio.TimeoutError:
-            logger.warning("Timeout while stopping scanner, forcing stop")
+            logger.warning(f"Timeout while stopping scanner after {SCANNER_STOP_TIMEOUT}s, forcing stop")
         except Exception as e:
             error_msg = str(e)
             if "InProgress" in error_msg:
-                logger.info("Scanner stop already in progress, waiting for completion")
+                logger.warning("Scanner stop already in progress, waiting for completion")
                 # InProgressエラーの場合は少し待機してから状態をクリア
                 await asyncio.sleep(0.5)
             else:
@@ -313,12 +319,19 @@ class BLEScanner:
         
         logger.info("Starting new scanner")
         # スキャンを再開
-        await self.scanner.start()
-        self._scanner_active = True  # スキャン状態フラグを設定
-        self._last_scan_time = time.time()
-        self._no_devices_count = 0
-        logger.info("Scanner recreated successfully")
-        logger.debug(f"Scanner active: {self._scanner_active}, last scan time: {self._last_scan_time}")
+        try:
+            await asyncio.wait_for(self.scanner.start(), timeout=SCANNER_START_TIMEOUT)
+            self._scanner_active = True  # スキャン状態フラグを設定
+            self._last_scan_time = time.time()
+            self._no_devices_count = 0
+            logger.info("Scanner recreated successfully")
+            logger.debug(f"Scanner active: {self._scanner_active}, last scan time: {self._last_scan_time}")
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout starting new scanner after {SCANNER_START_TIMEOUT}s")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to start new scanner: {e}")
+            raise
 
     async def _update_recreation_stats(self) -> None:
         """
@@ -425,7 +438,7 @@ class BLEScanner:
             while not self._stop_event.is_set():
                 # 排他制御が有効な場合、クライアント接続要求をチェック
                 if self._exclusive_control_enabled and _scanner_stopping:
-                    logger.info("Scanner stop requested for client connection")
+                    logger.info("scan loop: Scanner stop requested for client connection")
                     
                     # スキャン停止前の統計をログ出力
                     active_devices = self.cache.get_all_devices()
@@ -437,7 +450,7 @@ class BLEScanner:
                     
                     # クライアント完了を待機（タイムアウト付き）
                     try:
-                        await asyncio.wait_for(_client_completed.wait(), timeout=60.0)  # 60秒タイムアウト
+                        await asyncio.wait_for(_client_completed.wait(), timeout=CLIENT_COMPLETION_TIMEOUT)
                     except asyncio.TimeoutError:
                         logger.warning("Timeout waiting for client completion, forcing scanner restart")
                         # タイムアウトした場合は強制的にスキャンを再開
@@ -455,9 +468,13 @@ class BLEScanner:
                     # スキャンを再開
                     logger.info("Restarting scanner after client connection")
                     try:
-                        await self.scanner.start()
+                        await asyncio.wait_for(self.scanner.start(), timeout=SCANNER_START_TIMEOUT)
                         self._scanner_active = True
                         logger.info("Scanner restarted successfully")
+                    except asyncio.TimeoutError:
+                        logger.error(f"Timeout starting scanner after {SCANNER_START_TIMEOUT}s")
+                        # タイムアウトした場合は再作成を試行
+                        await self._recreate_scanner()
                     except Exception as e:
                         logger.error(f"Failed to restart scanner: {e}")
                         # 再開に失敗した場合は再作成を試行
@@ -524,13 +541,18 @@ class BLEScanner:
         _client_completed.clear()
         
         try:
-            await self.scanner.start()
+            await asyncio.wait_for(self.scanner.start(), timeout=SCANNER_START_TIMEOUT)
             self._scanner_active = True  # スキャン状態フラグを設定
             self._task = asyncio.create_task(self._scan_loop())
             logger.info("BLE scanner started successfully")
             
             # スキャン準備完了を通知
             _scan_ready.set()
+        except asyncio.TimeoutError:
+            self.is_running = False
+            self._scanner_active = False
+            logger.error(f"Timeout starting BLE scanner after {SCANNER_START_TIMEOUT}s")
+            raise
         except Exception as e:
             self.is_running = False
             self._scanner_active = False
