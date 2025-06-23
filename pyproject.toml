@@ -7,7 +7,8 @@ name = "ble-orchestrator"
 version = "0.1.0"
 description = "BLE制御用の常駐サービス"
 readme = "README.md"
-license = {file = "LICENSE"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     {name = "BLE Orchestrator Team", email = "your-email@example.com"}
 ]
@@ -18,7 +19,6 @@ keywords = ["bluetooth", "ble", "orchestrator", "service", "raspberry-pi"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
