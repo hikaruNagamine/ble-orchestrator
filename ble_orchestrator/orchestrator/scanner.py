@@ -25,9 +25,9 @@ NO_DEVICES_THRESHOLD = 90
 # クライアント完了待機のタイムアウト（秒）
 CLIENT_COMPLETION_TIMEOUT = 60.0
 # スキャナー開始のタイムアウト（秒）
-SCANNER_START_TIMEOUT = 5.0
+SCANNER_START_TIMEOUT = 10.0
 # スキャナー停止のタイムアウト（秒）
-SCANNER_STOP_TIMEOUT = 5.0
+SCANNER_STOP_TIMEOUT = 10.0
 
 # BLE操作の排他制御用グローバルロック
 _ble_operation_lock = asyncio.Lock()
@@ -219,6 +219,12 @@ class BLEScanner:
         # デッドロック検出用
         self._exclusive_control_start_time = None  # 排他制御開始時刻
         self._deadlock_threshold = 90  # 90秒以上排他制御が続く場合はデッドロックとみなす
+        
+        # ループ状態監視用
+        self._loop_monitor_task = None  # ループ監視タスク
+        self._last_loop_activity = time.time()  # 最後のループ活動時刻
+        self._loop_activity_timeout = 180.0  # ループ活動タイムアウト（秒）
+        self._loop_monitoring_enabled = True  # ループ監視の有効/無効フラグ
 
     async def _detection_callback(self, device: BLEDevice, adv_data: AdvertisementData) -> None:
         """
@@ -299,6 +305,9 @@ class BLEScanner:
                 # ウォッチドッグに通知（service.pyの改善された機能を使用）
                 self._notify_watchdog_func()
                 logger.info("Watchdog notification sent")
+                # ウォッチドッグ側で bluetooth service を再起動するまで待機
+                logger.info("Waiting for watchdog to restart bluetooth service")
+                await asyncio.sleep(10.0)
                 
             except Exception as e:
                 logger.error(f"Failed to notify watchdog: {e}")
@@ -436,6 +445,9 @@ class BLEScanner:
         try:
             # スキャンループの開始　スキャンループの終了条件は、スキャン停止イベントが設定されている場合
             while not self._stop_event.is_set():
+                # ループ活動を更新
+                self._update_loop_activity()
+                
                 # 排他制御が有効な場合、クライアント接続要求をチェック
                 if self._exclusive_control_enabled and _scanner_stopping:
                     logger.info("scan loop: Scanner stop requested for client connection")
@@ -523,6 +535,48 @@ class BLEScanner:
         finally:
             logger.info("Scan loop terminated")
 
+    def _update_loop_activity(self) -> None:
+        """
+        ループ活動時刻を更新
+        """
+        self._last_loop_activity = time.time()
+
+    async def _loop_monitor(self) -> None:
+        """
+        スキャンループの状態を監視
+        """
+        try:
+            while self.is_running and not self._stop_event.is_set():
+                await asyncio.sleep(30.0)  # 30秒ごとにチェック
+                
+                if not self._loop_monitoring_enabled:
+                    continue
+                
+                current_time = time.time()
+                time_since_activity = current_time - self._last_loop_activity
+                
+                # ループ活動がタイムアウトを超えた場合
+                if time_since_activity > self._loop_activity_timeout:
+                    logger.error(f"SCANNER LOOP INACTIVE: No activity for {time_since_activity:.1f}s, notifying watchdog")
+                    
+                    # ループ監視を一時的に無効化（重複通知を防ぐ）
+                    self._loop_monitoring_enabled = False
+                    
+                    # ウォッチドッグに通知
+                    if self._notify_watchdog_func:
+                        self._notify_watchdog_func()
+                    
+                    # 通知後は少し待機してから監視を再開
+                    await asyncio.sleep(10.0)
+                    self._loop_monitoring_enabled = True
+                    
+        except asyncio.CancelledError:
+            logger.info("Loop monitor cancelled")
+        except Exception as e:
+            logger.error(f"Error in loop monitor: {e}")
+        finally:
+            logger.info("Loop monitor terminated")
+
     async def start(self) -> None:
         """
         スキャンを開始
@@ -544,6 +598,11 @@ class BLEScanner:
             await asyncio.wait_for(self.scanner.start(), timeout=SCANNER_START_TIMEOUT)
             self._scanner_active = True  # スキャン状態フラグを設定
             self._task = asyncio.create_task(self._scan_loop())
+            
+            # ループ監視タスクを開始
+            self._loop_monitor_task = asyncio.create_task(self._loop_monitor())
+            self._last_loop_activity = time.time()  # 初期化
+            
             logger.info("BLE scanner started successfully")
             
             # スキャン準備完了を通知
@@ -621,6 +680,20 @@ class BLEScanner:
         logger.info("Stopping BLE scanner")
         self._stop_event.set()
         
+        # ループ監視タスクを停止
+        if self._loop_monitor_task:
+            try:
+                self._loop_monitor_task.cancel()
+                await asyncio.wait_for(self._loop_monitor_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("Timeout while waiting for loop monitor task to cancel")
+            except asyncio.CancelledError:
+                logger.debug("Loop monitor task cancelled successfully")
+            except Exception as e:
+                logger.error(f"Error cancelling loop monitor task: {e}")
+            finally:
+                self._loop_monitor_task = None
+        
         if self._task:
             try:
                 # タスクをキャンセル
@@ -655,6 +728,7 @@ class BLEScanner:
         """
         current_time = time.time()
         time_since_last_scan = current_time - self._last_scan_time
+        time_since_loop_activity = current_time - self._last_loop_activity
         
         # キャッシュ統計を取得
         cache_stats = self.cache.get_cache_stats()
@@ -672,5 +746,11 @@ class BLEScanner:
             "total_cached_devices": cache_stats["total_devices"],
             "expired_devices": cache_stats["expired_devices"],
             "cache_stats": cache_stats,
-            "scan_health": "healthy" if time_since_last_scan < 60 else "warning" if time_since_last_scan < 300 else "critical"
+            "scan_health": "healthy" if time_since_last_scan < 60 else "warning" if time_since_last_scan < 300 else "critical",
+            # ループ監視情報を追加
+            "loop_monitoring_enabled": self._loop_monitoring_enabled,
+            "last_loop_activity": self._last_loop_activity,
+            "time_since_loop_activity": time_since_loop_activity,
+            "loop_activity_timeout": self._loop_activity_timeout,
+            "loop_health": "healthy" if time_since_loop_activity < self._loop_activity_timeout else "critical"
         } 

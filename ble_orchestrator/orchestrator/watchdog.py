@@ -30,16 +30,19 @@ class BLEWatchdog:
         get_failures_func: Callable[[], int],
         reset_failures_func: Callable[[], None],
         adapters: Optional[list] = None,
+        scanner=None,  # スキャナーインスタンスを追加
     ):
         """
         初期化
         get_failures_func: 連続失敗回数を取得する関数
         reset_failures_func: 失敗カウンタをリセットする関数
         adapters: BLEアダプタ名のリスト（デフォルト: config.BLE_ADAPTERS）
+        scanner: スキャナーインスタンス（ループ監視用）
         """
         self._get_failures_func = get_failures_func
         self._reset_failures_func = reset_failures_func
         self._adapters = adapters or BLE_ADAPTERS
+        self._scanner = scanner  # スキャナーインスタンス
         self._stop_event = asyncio.Event()
         self._task = None
         self._recovery_in_progress = False
@@ -204,6 +207,9 @@ class BLEWatchdog:
                     # スキャナーの異常検出（追加）
                     await self._check_scanner_health()
                     
+                    # スキャナーのループ状態監視（追加）
+                    await self._check_scanner_loop_health()
+                    
                     # 定期的にハートビートログを出力
                     uptime = time.time() - self._start_time
                     logger.debug(
@@ -241,6 +247,55 @@ class BLEWatchdog:
                         return
         except Exception as e:
             logger.error(f"Error in scanner health check: {e}")
+
+    async def _check_scanner_loop_health(self) -> None:
+        """
+        スキャナーのループ状態監視
+        """
+        try:
+            if not self._scanner:
+                return
+                
+            # スキャナーの状態を取得
+            scanner_status = self._scanner.get_scanner_status()
+            
+            # スキャナーが停止している場合
+            if not scanner_status.get("is_running", False):
+                logger.warning("Scanner is not running, attempting to restart")
+                if not self._recovery_in_progress:
+                    logger.warning("Starting recovery due to scanner not running")
+                    asyncio.create_task(self._recover_ble_adapter())
+                return
+            
+            # ループ監視が有効でない場合
+            if not scanner_status.get("loop_monitoring_enabled", True):
+                return
+            
+            # ループ活動のタイムアウトをチェック
+            time_since_loop_activity = scanner_status.get("time_since_loop_activity", 0)
+            loop_activity_timeout = scanner_status.get("loop_activity_timeout", 60.0)
+            
+            if time_since_loop_activity > loop_activity_timeout:
+                logger.error(f"SCANNER LOOP INACTIVE: No activity for {time_since_loop_activity:.1f}s, starting recovery")
+                if not self._recovery_in_progress:
+                    logger.warning("Starting recovery due to scanner loop inactivity")
+                    asyncio.create_task(self._recover_ble_adapter())
+                return
+            
+            # スキャン活動のタイムアウトをチェック
+            time_since_last_scan = scanner_status.get("time_since_last_scan", 0)
+            if time_since_last_scan > 300:  # 5分以上スキャン結果がない場合
+                logger.warning(f"Scanner has not detected devices for {time_since_last_scan:.1f}s")
+                # ただし、ループ自体は活動している場合は復旧しない
+                if time_since_loop_activity < 30:  # ループが30秒以内に活動している場合は復旧しない
+                    return
+                    
+                if not self._recovery_in_progress:
+                    logger.warning("Starting recovery due to scanner inactivity despite loop activity")
+                    asyncio.create_task(self._recover_ble_adapter())
+                    
+        except Exception as e:
+            logger.error(f"Error in scanner loop health check: {e}")
 
     async def _recover_ble_adapter(self) -> None:
         """
@@ -314,6 +369,17 @@ class BLEWatchdog:
                 else:
                     logger.info("All adapters recovered successfully after service restart")
                     self._reset_failures_func()
+                    
+                    # スキャナーを再起動（追加）
+                    if self._scanner:
+                        try:
+                            logger.info("Restarting scanner after successful recovery")
+                            await self._scanner.stop()
+                            await asyncio.sleep(2.0)  # 少し待機
+                            await self._scanner.start()
+                            logger.info("Scanner restarted successfully after recovery")
+                        except Exception as e:
+                            logger.error(f"Failed to restart scanner after recovery: {e}")
             else:
                 logger.error("Failed to restart Bluetooth service")
                 # サービス再起動に失敗した場合でも、アダプタリセットが成功していれば失敗カウンタをリセット
@@ -464,9 +530,31 @@ class BLEWatchdog:
             if recovered_count == len(self._adapters):
                 logger.info("All adapters recovered successfully after BleakClient failure")
                 self._reset_failures_func()
+                
+                # スキャナーを再起動（追加）
+                if self._scanner:
+                    try:
+                        logger.info("Restarting scanner after successful lightweight recovery")
+                        await self._scanner.stop()
+                        await asyncio.sleep(1.0)  # 少し待機
+                        await self._scanner.start()
+                        logger.info("Scanner restarted successfully after lightweight recovery")
+                    except Exception as e:
+                        logger.error(f"Failed to restart scanner after lightweight recovery: {e}")
             elif reset_success_count > 0:
                 logger.info(f"Partial recovery: {recovered_count}/{len(self._adapters)} adapters recovered")
                 self._reset_failures_func()
+                
+                # 部分的な復旧でもスキャナーを再起動（追加）
+                if self._scanner:
+                    try:
+                        logger.info("Restarting scanner after partial recovery")
+                        await self._scanner.stop()
+                        await asyncio.sleep(1.0)  # 少し待機
+                        await self._scanner.start()
+                        logger.info("Scanner restarted successfully after partial recovery")
+                    except Exception as e:
+                        logger.error(f"Failed to restart scanner after partial recovery: {e}")
             else:
                 logger.error("Failed to recover any adapters after BleakClient failure")
         

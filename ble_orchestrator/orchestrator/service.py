@@ -76,7 +76,8 @@ class BLEOrchestratorService:
         self.watchdog = BLEWatchdog(
             self.handler.get_consecutive_failures,
             self.handler.reset_failure_count,
-            adapters=BLE_ADAPTERS
+            adapters=BLE_ADAPTERS,
+            scanner=self.scanner  # スキャナーインスタンスを渡す
         )
         
         # リクエストキュー（handlerの参照を設定）
