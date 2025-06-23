@@ -86,6 +86,7 @@ class BLERequestHandler:
     async def _handle_scan_request(self, request: ScanRequest) -> None:
         """
         スキャン済みデータを取得して返す（デバイスに接続せずに）
+        scan_commandは軽量処理のため、排他制御を回避して高速化
         """
         # スキャン関数が設定されていない場合はエラー
         if not self._get_scan_data_func:
@@ -94,10 +95,17 @@ class BLERequestHandler:
             
         logger.debug(f"Getting scan data for {request.mac_address}")
         
-        # スキャン済みデータを取得
+        # スキャン済みデータを取得（排他制御なしで高速処理）
         scan_data = self._get_scan_data_func(request.mac_address)
         if not scan_data:
             logger.warning(f"No scan data found for device {request.mac_address}")
+            # データが見つからない場合でもレスポンスを返す
+            request.response_data = {
+                "error": f"Device {request.mac_address} not found or scan data expired",
+                "address": request.mac_address
+            }
+            request.status = RequestStatus.COMPLETED
+            logger.info(f"Scan request {request.request_id} for {request.mac_address} completed (no data)")
             return
         
         logger.debug(f"scan_data: {scan_data}")
@@ -178,7 +186,7 @@ class BLERequestHandler:
         # リクエスト完了
         request.status = RequestStatus.COMPLETED
         
-        logger.info(f"Scan request {request.request_id} for {request.mac_address} processed")
+        logger.info(f"Scan request {request.request_id} for {request.mac_address} processed successfully")
         logger.debug(f"Scan result: {scan_result}")
 
     async def _handle_read_request(self, request: ReadRequest) -> None:
@@ -198,12 +206,15 @@ class BLERequestHandler:
                     # スキャナー停止を要求
                     self._scanner.request_scanner_stop()
                     
-                    # スキャン停止完了を待機
+                    # スキャン停止完了を待機（タイムアウト付き）
                     scan_completed_event = self._scanner.wait_for_scan_completed()
-                    await scan_completed_event.wait()
-                    scan_completed_event.clear()
-                    
-                    logger.debug("Scanner stopped for read operation")
+                    try:
+                        await asyncio.wait_for(scan_completed_event.wait(), timeout=10.0)  # 10秒タイムアウト
+                        scan_completed_event.clear()
+                        logger.debug("Scanner stopped for read operation")
+                    except asyncio.TimeoutError:
+                        logger.warning("Timeout waiting for scanner stop completion, proceeding anyway")
+                        # タイムアウトしても処理を継続
                 except Exception as e:
                     logger.warning(f"Failed to stop scanner for read operation: {e}")
 
@@ -267,12 +278,15 @@ class BLERequestHandler:
                     # スキャナー停止を要求
                     self._scanner.request_scanner_stop()
                     
-                    # スキャン停止完了を待機
+                    # スキャン停止完了を待機（タイムアウト付き）
                     scan_completed_event = self._scanner.wait_for_scan_completed()
-                    await scan_completed_event.wait()
-                    scan_completed_event.clear()
-                    
-                    logger.debug("Scanner stopped for write operation")
+                    try:
+                        await asyncio.wait_for(scan_completed_event.wait(), timeout=10.0)  # 10秒タイムアウト
+                        scan_completed_event.clear()
+                        logger.debug("Scanner stopped for write operation")
+                    except asyncio.TimeoutError:
+                        logger.warning("Timeout waiting for scanner stop completion, proceeding anyway")
+                        # タイムアウトしても処理を継続
                 except Exception as e:
                     logger.warning(f"Failed to stop scanner for write operation: {e}")
 

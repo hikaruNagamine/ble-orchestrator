@@ -164,12 +164,15 @@ class NotificationManager:
                         # スキャナー停止を要求
                         self._scanner.request_scanner_stop()
                         
-                        # スキャン停止完了を待機
+                        # スキャン停止完了を待機（タイムアウト付き）
                         scan_completed_event = self._scanner.wait_for_scan_completed()
-                        await scan_completed_event.wait()
-                        scan_completed_event.clear()
-                        
-                        logger.debug("Scanner stopped for notification connection")
+                        try:
+                            await asyncio.wait_for(scan_completed_event.wait(), timeout=10.0)  # 10秒タイムアウト
+                            scan_completed_event.clear()
+                            logger.debug("Scanner stopped for notification connection")
+                        except asyncio.TimeoutError:
+                            logger.warning("Timeout waiting for scanner stop completion, proceeding anyway")
+                            # タイムアウトしても処理を継続
                     except Exception as e:
                         logger.warning(f"Failed to stop scanner for notification connection: {e}")
                 

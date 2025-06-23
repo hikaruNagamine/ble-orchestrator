@@ -163,6 +163,9 @@ class IPCServer:
         
         self._connections.add(writer)
         
+        # クライアントの進行中リクエストを追跡
+        client_requests = set()
+        
         try:
             while not self._stop_event.is_set():
                 # リクエスト読み取り
@@ -178,6 +181,11 @@ class IPCServer:
                     
                     request = json.loads(request_str)
                     command = request.get("command")
+                    request_id = request.get("request_id")
+                    
+                    # リクエストIDを追跡
+                    if request_id:
+                        client_requests.add(request_id)
                     
                     response = await self._process_command(command, request, writer, client_id)
                     
@@ -186,6 +194,10 @@ class IPCServer:
                     writer.write(response_json.encode())
                     await writer.drain()
                     logger.debug(f"Sent response to client {client_id}: {response_json}")
+                    
+                    # 完了したリクエストを追跡から削除
+                    if request_id and request_id in client_requests:
+                        client_requests.discard(request_id)
                     
                 except json.JSONDecodeError:
                     error_resp = {"status": "error", "error": "Invalid JSON"}
@@ -202,6 +214,16 @@ class IPCServer:
         except Exception as e:
             logger.error(f"Error in client handler for {client_id}: {e}")
         finally:
+            # クライアントクラッシュ時の処理
+            if client_requests:
+                logger.warning(f"Client {client_id} crashed with {len(client_requests)} pending requests: {client_requests}")
+                # 進行中のリクエストの状態をログ出力
+                if self._queue_manager:
+                    for req_id in client_requests:
+                        req_status = self._queue_manager.get_request_status(req_id)
+                        if req_status:
+                            logger.info(f"Pending request {req_id} status: {req_status.status.name}")
+            
             # クライアント登録から削除
             self._connections.discard(writer)
             

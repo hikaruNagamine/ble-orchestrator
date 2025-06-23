@@ -19,7 +19,7 @@ from .types import ScanResult
 logger = logging.getLogger(__name__)
 
 # スキャナー再作成の最小間隔（秒）
-MIN_SCANNER_RECREATE_INTERVAL = 300  # 5分
+MIN_SCANNER_RECREATE_INTERVAL = 180  # 3分
 # デバイス未検出の許容時間（秒）
 NO_DEVICES_THRESHOLD = 60
 
@@ -126,10 +126,15 @@ class ScanCache:
             logger.debug(f"Latest result timestamp: {latest_result.timestamp}")
         
         # TTLチェック
-        if time.time() - latest_result.timestamp > self._ttl_seconds:
+        current_time = time.time()
+        age = current_time - latest_result.timestamp
+        if age > self._ttl_seconds:
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"Scan result for {address} is expired")
+                logger.debug(f"Scan result for {address} is expired (age: {age:.1f}s, TTL: {self._ttl_seconds}s)")
             return None
+            
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Returning valid scan result for {address} (age: {age:.1f}s)")
             
         return latest_result
 
@@ -151,14 +156,30 @@ class ScanCache:
         """
         キャッシュの統計情報を取得
         """
+        current_time = time.time()
         total_devices = len(self._cache)
         total_results = sum(len(results) for results in self._cache.values())
         
+        # 有効なデバイス数を計算
+        valid_devices = 0
+        expired_devices = 0
+        for address, results in self._cache.items():
+            if results:
+                latest_result = results[-1]
+                age = current_time - latest_result.timestamp
+                if age <= self._ttl_seconds:
+                    valid_devices += 1
+                else:
+                    expired_devices += 1
+        
         return {
             "total_devices": total_devices,
+            "valid_devices": valid_devices,
+            "expired_devices": expired_devices,
             "total_results": total_results,
             "last_cleanup": self._last_cleanup,
-            "cleanup_interval": self._cleanup_interval
+            "cleanup_interval": self._cleanup_interval,
+            "ttl_seconds": self._ttl_seconds
         }
 
 
@@ -188,6 +209,10 @@ class BLEScanner:
         
         # 排他制御用の状態管理
         self._exclusive_control_enabled = True  # 排他制御の有効/無効フラグ
+        
+        # デッドロック検出用
+        self._exclusive_control_start_time = None  # 排他制御開始時刻
+        self._deadlock_threshold = 90  # 90秒以上排他制御が続く場合はデッドロックとみなす
 
     async def _detection_callback(self, device: BLEDevice, adv_data: AdvertisementData) -> None:
         """
@@ -198,6 +223,17 @@ class BLEScanner:
         
         self._last_scan_time = time.time()
         await self.cache.add_result(device, adv_data)
+        
+        # 定期的に検出統計をログ出力（1分ごと）
+        current_time = time.time()
+        if hasattr(self, '_last_stats_log') and (current_time - self._last_stats_log) > 60:
+            cache_stats = self.cache.get_cache_stats()
+            logger.info(f"Scan statistics - Active devices: {cache_stats['valid_devices']}, "
+                       f"Total cached: {cache_stats['total_devices']}, "
+                       f"Expired: {cache_stats['expired_devices']}")
+            self._last_stats_log = current_time
+        elif not hasattr(self, '_last_stats_log'):
+            self._last_stats_log = current_time
 
     async def _should_skip_recreation(self) -> bool:
         """
@@ -211,6 +247,11 @@ class BLEScanner:
         # 最小再作成間隔をチェック
         current_time = time.time()
         if current_time - self._last_recreate_time < MIN_SCANNER_RECREATE_INTERVAL:
+            # ただし、異常な長時間のスキャン停止の場合は強制再作成
+            time_since_last_scan = current_time - self._last_scan_time
+            if time_since_last_scan > 300:  # 5分以上
+                logger.warning(f"Force recreation despite interval restriction - no scan for {time_since_last_scan:.1f}s")
+                return False
             logger.info("Skipping scanner recreation due to minimum interval restriction")
             return True
             
@@ -366,12 +407,19 @@ class BLEScanner:
             logger.warning(f"Recreation needed: No scan results for {NO_DEVICES_THRESHOLD} seconds (last scan: {time_since_last_scan:.1f}s ago)")
             return True, f"No scan results for {NO_DEVICES_THRESHOLD} seconds (last scan: {time_since_last_scan:.1f}s ago)"
         
+        # 異常な長時間のスキャン停止を検出（追加）
+        if time_since_last_scan > 300:  # 5分以上
+            logger.error(f"CRITICAL: Scanner appears to be completely stopped - no scan results for {time_since_last_scan:.1f}s")
+            return True, f"Scanner appears stopped - no scan results for {time_since_last_scan:.1f}s"
+        
         return False, ""
 
     async def _scan_loop(self) -> None:
         """
         スキャンループ
         """
+        global _scanner_stopping, _client_connecting, _scan_completed, _client_completed, _scan_ready
+        
         try:
             # スキャンループの開始　スキャンループの終了条件は、スキャン停止イベントが設定されている場合
             while not self._stop_event.is_set():
@@ -387,9 +435,12 @@ class BLEScanner:
                     await self._stop_current_scanner()
                     _scan_completed.set()  # スキャン停止完了を通知
                     
-                    # クライアント完了を待機
+                    # クライアント完了を待機（タイムアウト付き）
                     try:
-                        await _client_completed.wait()
+                        await asyncio.wait_for(_client_completed.wait(), timeout=60.0)  # 60秒タイムアウト
+                    except asyncio.TimeoutError:
+                        logger.warning("Timeout waiting for client completion, forcing scanner restart")
+                        # タイムアウトした場合は強制的にスキャンを再開
                     except asyncio.CancelledError:
                         logger.warning("Scan loop cancelled")
                         break
@@ -417,6 +468,19 @@ class BLEScanner:
                 # スキャナーはコールバック方式なので、待機するだけ
                 await asyncio.sleep(SCAN_INTERVAL_SEC)
                 
+                # デッドロック検出
+                if self._exclusive_control_start_time:
+                    current_time = time.time()
+                    exclusive_duration = current_time - self._exclusive_control_start_time
+                    if exclusive_duration > self._deadlock_threshold:
+                        logger.error(f"POTENTIAL DEADLOCK DETECTED: Exclusive control active for {exclusive_duration:.1f}s")
+                        # デッドロックを検出した場合は強制的にリセット
+                        _scanner_stopping = False
+                        _client_connecting = False
+                        _client_completed.set()
+                        self._exclusive_control_start_time = None
+                        logger.warning("Forced reset of exclusive control due to potential deadlock")
+                
                 # スキャナー再作成が必要かどうかを判定
                 need_recreation, recreation_reason = self._check_recreation_needed()
                 
@@ -424,6 +488,13 @@ class BLEScanner:
                 if need_recreation:
                     logger.warning(f"{recreation_reason}, recreating scanner")
                     await self._recreate_scanner()
+                    
+                    # 異常な長時間のスキャン停止の場合はウォッチドッグに通知
+                    time_since_last_scan = time.time() - self._last_scan_time
+                    if time_since_last_scan > 300:  # 5分以上
+                        logger.error(f"CRITICAL: Scanner has been stopped for {time_since_last_scan:.1f}s, notifying watchdog")
+                        if self._notify_watchdog_func:
+                            self._notify_watchdog_func()
                     
         except asyncio.CancelledError:
             logger.info("Scan loop cancelled")
@@ -473,6 +544,7 @@ class BLEScanner:
         global _scanner_stopping, _client_connecting
         _scanner_stopping = True
         _client_connecting = True
+        self._exclusive_control_start_time = time.time()  # 排他制御開始時刻を記録
         logger.info("Scanner stop requested for client connection")
 
     def notify_client_completed(self) -> None:
@@ -483,7 +555,14 @@ class BLEScanner:
         _client_connecting = False
         _scanner_stopping = False
         _client_completed.set()
-        logger.info("Client operation completed, scanner can resume")
+        
+        # 排他制御時間をログ出力
+        if self._exclusive_control_start_time:
+            duration = time.time() - self._exclusive_control_start_time
+            logger.info(f"Client operation completed, scanner can resume (exclusive control duration: {duration:.1f}s)")
+            self._exclusive_control_start_time = None  # リセット
+        else:
+            logger.info("Client operation completed, scanner can resume")
 
     def wait_for_scan_ready(self) -> asyncio.Event:
         """
@@ -555,6 +634,9 @@ class BLEScanner:
         current_time = time.time()
         time_since_last_scan = current_time - self._last_scan_time
         
+        # キャッシュ統計を取得
+        cache_stats = self.cache.get_cache_stats()
+        
         return {
             "is_running": self.is_running,
             "scanner_active": self._scanner_active,
@@ -564,6 +646,9 @@ class BLEScanner:
             "no_devices_count": self._no_devices_count,
             "recreate_count": self._recreate_count,
             "last_device_count": self._last_device_count,
-            "active_devices": len(self.cache.get_all_devices()),
-            "cache_stats": self.cache.get_cache_stats()
+            "active_devices": cache_stats["valid_devices"],
+            "total_cached_devices": cache_stats["total_devices"],
+            "expired_devices": cache_stats["expired_devices"],
+            "cache_stats": cache_stats,
+            "scan_health": "healthy" if time_since_last_scan < 60 else "warning" if time_since_last_scan < 300 else "critical"
         } 

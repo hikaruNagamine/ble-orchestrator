@@ -201,6 +201,9 @@ class BLEWatchdog:
                             # 別タスクで復旧処理を実行
                             asyncio.create_task(self._recover_ble_adapter())
                     
+                    # スキャナーの異常検出（追加）
+                    await self._check_scanner_health()
+                    
                     # 定期的にハートビートログを出力
                     uptime = time.time() - self._start_time
                     logger.debug(
@@ -219,6 +222,25 @@ class BLEWatchdog:
                     await asyncio.sleep(WATCHDOG_CHECK_INTERVAL_SEC)
         finally:
             logger.info("Watchdog loop terminated")
+
+    async def _check_scanner_health(self) -> None:
+        """
+        スキャナーの健全性をチェック
+        """
+        try:
+            # スキャナーの状態を確認（サービスから取得する必要がある）
+            # ここでは簡易的なチェックとして、BLEアダプタの状態を確認
+            for adapter in self._adapters:
+                status = await self._check_adapter_status(adapter)
+                if status != "UP RUNNING":
+                    logger.warning(f"Scanner health check: Adapter {adapter} has issues: {status}")
+                    # アダプタに問題がある場合は復旧を開始
+                    if not self._recovery_in_progress:
+                        logger.warning(f"Starting recovery due to adapter {adapter} issues")
+                        asyncio.create_task(self._recover_ble_adapter())
+                        return
+        except Exception as e:
+            logger.error(f"Error in scanner health check: {e}")
 
     async def _recover_ble_adapter(self) -> None:
         """
