@@ -12,7 +12,7 @@ import uuid
 
 from bleak.backends.device import BLEDevice
 
-from .config import LOG_DIR, LOG_FILE, DEFAULT_REQUEST_TIMEOUT_SEC
+from .config import LOG_DIR, LOG_FILE, DEFAULT_REQUEST_TIMEOUT_SEC, BLE_ADAPTERS, EXCLUSIVE_CONTROL_ENABLED
 from .handler import BLERequestHandler
 from .ipc_server import IPCServer
 from .queue_manager import RequestQueueManager
@@ -42,38 +42,73 @@ class BLEOrchestratorService:
         self._setup_logging()
         self._start_time = time.time()
         
-        # スキャナー
-        self.scanner = BLEScanner()
+        # スキャナー（ウォッチドッグ通知機能付き）
+        self.scanner = BLEScanner(notify_watchdog_func=self._notify_watchdog)
         
-        # リクエストハンドラー
+        # リクエストキュー（一時的にhandlerなしで初期化）
+        self.queue_manager = None  # 後で設定
+        
+        # ウォッチドッグ（一時的にhandlerなしで初期化）
+        self.watchdog = None  # 後で設定
+        
+        # BleakClient失敗時のウォッチドッグ通知関数
+        def notify_bleakclient_failure():
+            async def _async_notify():
+                try:
+                    if self.watchdog:
+                        await self.watchdog.notify_component_issue(
+                            "bleakclient_failure",
+                            "BleakClient connection failed after retry attempts"
+                        )
+                except Exception as e:
+                    logger.error(f"Error notifying watchdog of BleakClient failure: {e}")
+            asyncio.create_task(_async_notify())
+        
+        # リクエストハンドラー（スキャナー連携付き、ウォッチドッグ通知機能付き）
         self.handler = BLERequestHandler(
             get_device_func=self._get_ble_device,
-            get_scan_data_func=self._get_ble_device
+            get_scan_data_func=self._get_ble_device,
+            scanner=self.scanner,  # スキャナーインスタンスを渡す
+            notify_watchdog_func=notify_bleakclient_failure  # ウォッチドッグ通知関数を渡す
         )
         
-        # リクエストキュー
-        self.queue_manager = RequestQueueManager(self.handler.handle_request)
-        
-        # ウォッチドッグ
+        # ウォッチドッグ（handlerの参照を設定）
         self.watchdog = BLEWatchdog(
             self.handler.get_consecutive_failures,
-            self.handler.reset_failure_count
+            self.handler.reset_failure_count,
+            adapters=BLE_ADAPTERS,
+            scanner=self.scanner  # スキャナーインスタンスを渡す
         )
+        
+        # リクエストキュー（handlerの参照を設定）
+        self.queue_manager = RequestQueueManager(self.handler.handle_request)
         
         # 通知マネージャー
         self.notification_manager = NotificationManager(
             self._get_ble_device,
-            self._handle_notification
+            self._handle_notification,
+            scanner=self.scanner,  # スキャナーインスタンスを渡す
+            notify_watchdog_func=notify_bleakclient_failure  # ウォッチドッグ通知関数を渡す
         )
         
         # IPCサーバー
         self.ipc_server = IPCServer(
             self._get_scan_result,
             self._enqueue_request,
-            self._get_service_status
+            self._get_service_status,
+            queue_manager=self.queue_manager
         )
         
         logger.info("BLE Orchestrator service initialized")
+        
+        # 排他制御設定を適用
+        if not EXCLUSIVE_CONTROL_ENABLED:
+            logger.info("Exclusive control disabled by configuration")
+            self.scanner.set_exclusive_control_enabled(False)
+            self.handler.set_exclusive_control_enabled(False)
+            self.notification_manager.set_exclusive_control_enabled(False)
+        else:
+            logger.info("Exclusive control enabled by configuration")
 
     def _setup_logging(self) -> None:
         """
@@ -256,5 +291,63 @@ class BLEOrchestratorService:
             "last_error": status.last_error,
             "uptime_sec": round(status.uptime_sec, 1),
             "active_devices": len(self.scanner.cache.get_all_devices()),
-            "active_subscriptions": status.active_subscriptions
+            "active_subscriptions": status.active_subscriptions,
+            "exclusive_control_enabled": self.handler.is_exclusive_control_enabled(),
+            "client_connecting": self.scanner.is_client_connecting()
         }
+
+    def _notify_watchdog(self) -> None:
+        """
+        ウォッチドッグ通知機能
+        スキャナーの問題をウォッチドッグに通知し、復旧完了を待機
+        """
+        logger.info("Notifying watchdog of scanner issues")
+        # 非同期メソッドを同期的なコンテキストから呼び出すためのヘルパー
+        async def _async_notify():
+            try:
+                # ウォッチドッグに通知
+                await self.watchdog.notify_component_issue(
+                    "scanner",
+                    "Scanner detected potential Bluetooth stack issues"
+                )
+                
+                # 復旧完了を待機（タイムアウト: 60秒）
+                logger.info("Waiting for watchdog recovery completion...")
+                recovery_completed = await self.watchdog.wait_for_recovery_completion(timeout=60.0)
+                
+                if recovery_completed:
+                    logger.info("Watchdog recovery completed successfully")
+                    
+                    # Bluetoothサービスの準備完了を待機
+                    logger.info("Waiting for Bluetooth service to be ready...")
+                    service_ready = await self.watchdog.wait_for_bluetooth_service_ready(timeout=30.0)
+                    
+                    if service_ready:
+                        logger.info("Bluetooth service is ready")
+                        # サービス準備完了後、BLEアダプタの状態安定化を待機
+                        await asyncio.sleep(5.0)
+                    else:
+                        logger.warning("Bluetooth service not ready, waiting for stabilization...")
+                        await asyncio.sleep(10.0)
+                else:
+                    logger.warning("Watchdog recovery timeout, checking Bluetooth service status...")
+                    # タイムアウトした場合でも、Bluetoothサービスの状態を確認
+                    service_status = await self.watchdog.check_bluetooth_service_status()
+                    logger.info(f"Bluetooth service status: {service_status}")
+                    
+                    if service_status == "active":
+                        logger.info("Bluetooth service is active, proceeding...")
+                        await asyncio.sleep(5.0)
+                    else:
+                        logger.warning("Bluetooth service not active, waiting longer...")
+                        await asyncio.sleep(15.0)
+                
+                logger.info("Watchdog recovery wait completed")
+                
+            except Exception as e:
+                logger.error(f"Error in watchdog notification: {e}")
+                # エラーが発生した場合でも、BLEアダプタの状態安定化を待機
+                await asyncio.sleep(15.0)
+            
+        # 非同期通知をイベントループで実行
+        asyncio.create_task(_async_notify())

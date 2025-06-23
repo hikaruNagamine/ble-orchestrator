@@ -11,6 +11,8 @@ from typing import Callable, Optional
 from .config import (
     ADAPTER_RESET_COMMAND,
     BLUETOOTH_RESTART_COMMAND,
+    ADAPTER_STATUS_COMMAND,
+    BLE_ADAPTERS,
     CONSECUTIVE_FAILURES_THRESHOLD,
     WATCHDOG_CHECK_INTERVAL_SEC,
 )
@@ -27,21 +29,127 @@ class BLEWatchdog:
         self,
         get_failures_func: Callable[[], int],
         reset_failures_func: Callable[[], None],
-        adapter_name: str = "hci0",
+        adapters: Optional[list] = None,
+        scanner=None,  # スキャナーインスタンスを追加
     ):
         """
         初期化
         get_failures_func: 連続失敗回数を取得する関数
         reset_failures_func: 失敗カウンタをリセットする関数
-        adapter_name: BLEアダプタ名
+        adapters: BLEアダプタ名のリスト（デフォルト: config.BLE_ADAPTERS）
+        scanner: スキャナーインスタンス（ループ監視用）
         """
         self._get_failures_func = get_failures_func
         self._reset_failures_func = reset_failures_func
-        self._adapter_name = adapter_name
+        self._adapters = adapters or BLE_ADAPTERS
+        self._scanner = scanner  # スキャナーインスタンス
         self._stop_event = asyncio.Event()
         self._task = None
         self._recovery_in_progress = False
         self._start_time = time.time()
+        self._component_issues = {}  # コンポーネントごとの問題を追跡
+        self._adapter_status = {}  # 各アダプタの状態を追跡
+        self._recovery_completion_event = asyncio.Event()  # 復旧完了通知用
+        self._recovery_callbacks = []  # 復旧完了時のコールバック関数リスト
+
+    async def notify_component_issue(self, component_name: str, issue_description: str) -> None:
+        """
+        コンポーネントから問題の通知を受け取る
+        component_name: 問題を報告するコンポーネントの名前
+        issue_description: 問題の説明
+        """
+        logger.warning(f"Component issue reported - {component_name}: {issue_description}")
+        
+        # コンポーネントの問題を記録
+        self._component_issues[component_name] = {
+            'description': issue_description,
+            'timestamp': time.time()
+        }
+        
+        # BleakClient失敗の場合は軽量なアダプタリセットのみ実行
+        if component_name == "bleakclient_failure":
+            if not self._recovery_in_progress:
+                logger.info(f"Starting lightweight adapter reset due to BleakClient failure")
+                asyncio.create_task(self._reset_adapters_only())
+        else:
+            # その他の問題の場合は通常の復旧プロセスを開始
+            if not self._recovery_in_progress:
+                logger.info(f"Starting recovery process due to {component_name} issue")
+                asyncio.create_task(self._recover_ble_adapter())
+
+    def add_recovery_completion_callback(self, callback: Callable[[], None]) -> None:
+        """
+        復旧完了時のコールバック関数を追加
+        """
+        self._recovery_callbacks.append(callback)
+        logger.debug(f"Added recovery completion callback, total callbacks: {len(self._recovery_callbacks)}")
+
+    def remove_recovery_completion_callback(self, callback: Callable[[], None]) -> None:
+        """
+        復旧完了時のコールバック関数を削除
+        """
+        if callback in self._recovery_callbacks:
+            self._recovery_callbacks.remove(callback)
+            logger.debug(f"Removed recovery completion callback, remaining callbacks: {len(self._recovery_callbacks)}")
+
+    async def wait_for_recovery_completion(self, timeout: Optional[float] = None) -> bool:
+        """
+        復旧完了を待機
+        timeout: 待機タイムアウト（秒）、Noneの場合は無制限
+        返り値: 復旧が完了した場合はTrue、タイムアウトした場合はFalse
+        """
+        try:
+            await asyncio.wait_for(self._recovery_completion_event.wait(), timeout=timeout)
+            logger.info("Recovery completion event received")
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for recovery completion after {timeout}s")
+            return False
+
+    async def check_bluetooth_service_status(self) -> str:
+        """
+        Bluetoothサービスの状態を確認
+        返り値: サービスの状態（"active", "inactive", "failed", "unknown"）
+        """
+        try:
+            # systemctlでBluetoothサービスの状態を確認
+            result = await self._run_shell_command_with_output("systemctl is-active bluetooth")
+            
+            if result.strip() == "active":
+                return "active"
+            elif result.strip() == "inactive":
+                return "inactive"
+            elif result.strip() == "failed":
+                return "failed"
+            else:
+                return "unknown"
+        except Exception as e:
+            logger.error(f"Error checking Bluetooth service status: {e}")
+            return "unknown"
+
+    async def wait_for_bluetooth_service_ready(self, timeout: float = 30.0) -> bool:
+        """
+        Bluetoothサービスが準備完了するまで待機
+        timeout: 待機タイムアウト（秒）
+        返り値: サービスが準備完了した場合はTrue、タイムアウトした場合はFalse
+        """
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            status = await self.check_bluetooth_service_status()
+            
+            if status == "active":
+                logger.info("Bluetooth service is active and ready")
+                return True
+            elif status == "failed":
+                logger.warning("Bluetooth service is in failed state")
+                return False
+            
+            logger.debug(f"Bluetooth service status: {status}, waiting...")
+            await asyncio.sleep(2.0)
+        
+        logger.warning(f"Timeout waiting for Bluetooth service to be ready after {timeout}s")
+        return False
 
     async def start(self) -> None:
         """
@@ -96,6 +204,12 @@ class BLEWatchdog:
                             # 別タスクで復旧処理を実行
                             asyncio.create_task(self._recover_ble_adapter())
                     
+                    # スキャナーの異常検出（追加）
+                    await self._check_scanner_health()
+                    
+                    # スキャナーのループ状態監視（追加）
+                    await self._check_scanner_loop_health()
+                    
                     # 定期的にハートビートログを出力
                     uptime = time.time() - self._start_time
                     logger.debug(
@@ -115,46 +229,240 @@ class BLEWatchdog:
         finally:
             logger.info("Watchdog loop terminated")
 
+    async def _check_scanner_health(self) -> None:
+        """
+        スキャナーの健全性をチェック
+        """
+        try:
+            # スキャナーの状態を確認（サービスから取得する必要がある）
+            # ここでは簡易的なチェックとして、BLEアダプタの状態を確認
+            for adapter in self._adapters:
+                status = await self._check_adapter_status(adapter)
+                if status != "UP RUNNING":
+                    logger.warning(f"Scanner health check: Adapter {adapter} has issues: {status}")
+                    # アダプタに問題がある場合は復旧を開始
+                    if not self._recovery_in_progress:
+                        logger.warning(f"Starting recovery due to adapter {adapter} issues")
+                        asyncio.create_task(self._recover_ble_adapter())
+                        return
+        except Exception as e:
+            logger.error(f"Error in scanner health check: {e}")
+
+    async def _check_scanner_loop_health(self) -> None:
+        """
+        スキャナーのループ状態監視
+        """
+        try:
+            if not self._scanner:
+                return
+                
+            # スキャナーの状態を取得
+            scanner_status = self._scanner.get_scanner_status()
+            
+            # スキャナーが停止している場合
+            if not scanner_status.get("is_running", False):
+                logger.warning("Scanner is not running, attempting to restart")
+                if not self._recovery_in_progress:
+                    logger.warning("Starting recovery due to scanner not running")
+                    asyncio.create_task(self._recover_ble_adapter())
+                return
+            
+            # ループ監視が有効でない場合
+            if not scanner_status.get("loop_monitoring_enabled", True):
+                return
+            
+            # ループ活動のタイムアウトをチェック
+            time_since_loop_activity = scanner_status.get("time_since_loop_activity", 0)
+            loop_activity_timeout = scanner_status.get("loop_activity_timeout", 60.0)
+            
+            if time_since_loop_activity > loop_activity_timeout:
+                logger.error(f"SCANNER LOOP INACTIVE: No activity for {time_since_loop_activity:.1f}s, starting recovery")
+                if not self._recovery_in_progress:
+                    logger.warning("Starting recovery due to scanner loop inactivity")
+                    asyncio.create_task(self._recover_ble_adapter())
+                return
+            
+            # スキャン活動のタイムアウトをチェック
+            time_since_last_scan = scanner_status.get("time_since_last_scan", 0)
+            if time_since_last_scan > 300:  # 5分以上スキャン結果がない場合
+                logger.warning(f"Scanner has not detected devices for {time_since_last_scan:.1f}s")
+                # ただし、ループ自体は活動している場合は復旧しない
+                if time_since_loop_activity < 30:  # ループが30秒以内に活動している場合は復旧しない
+                    return
+                    
+                if not self._recovery_in_progress:
+                    logger.warning("Starting recovery due to scanner inactivity despite loop activity")
+                    asyncio.create_task(self._recover_ble_adapter())
+                    
+        except Exception as e:
+            logger.error(f"Error in scanner loop health check: {e}")
+
     async def _recover_ble_adapter(self) -> None:
         """
         BLEアダプタの復旧を試みる
-        1. アダプタリセット
-        2. Bluetoothサービス再起動
+        1. 各アダプタの状態確認
+        2. 問題のあるアダプタのリセット
+        3. Bluetoothサービス再起動（必ず実行）
         """
         self._recovery_in_progress = True
         
         try:
-            # まずアダプタリセットを試行
-            logger.info(f"Attempting to reset BLE adapter {self._adapter_name}")
-            reset_cmd = ADAPTER_RESET_COMMAND.format(adapter=self._adapter_name)
+            logger.info(f"Starting BLE adapter recovery for adapters: {self._adapters}")
             
-            success = await self._run_shell_command(reset_cmd)
-            if success:
-                logger.info(f"Successfully reset BLE adapter {self._adapter_name}")
-                self._reset_failures_func()
-                self._recovery_in_progress = False
-                return
+            # 1. 各アダプタの状態を確認
+            adapter_issues = []
+            for adapter in self._adapters:
+                status = await self._check_adapter_status(adapter)
+                self._adapter_status[adapter] = status
                 
-            # アダプタリセットが失敗した場合はBluetoothサービス再起動を試行
-            logger.warning(
-                f"Adapter reset failed. Attempting to restart Bluetooth service"
-            )
+                if status != "UP RUNNING":
+                    adapter_issues.append(adapter)
+                    logger.warning(f"Adapter {adapter} has issues: {status}")
+            
+            # 2. 問題のあるアダプタをリセット
+            if adapter_issues:
+                logger.info(f"Resetting problematic adapters: {adapter_issues}")
+                for adapter in adapter_issues:
+                    success = await self._reset_single_adapter(adapter)
+                    if success:
+                        logger.info(f"Successfully reset adapter {adapter}")
+                    else:
+                        logger.error(f"Failed to reset adapter {adapter}")
+                
+                # リセット後に少し待機
+                await asyncio.sleep(3.0)
+                
+                # リセット後の状態を再確認
+                still_problematic = []
+                for adapter in adapter_issues:
+                    status = await self._check_adapter_status(adapter)
+                    self._adapter_status[adapter] = status
+                    
+                    if status != "UP RUNNING":
+                        still_problematic.append(adapter)
+                        logger.warning(f"Adapter {adapter} still has issues after reset: {status}")
+            
+            # 3. Bluetoothサービス再起動（必ず実行）
+            logger.info("Performing Bluetooth service restart as part of recovery process")
             
             success = await self._run_shell_command(BLUETOOTH_RESTART_COMMAND)
             if success:
                 logger.info("Successfully restarted Bluetooth service")
-                # 再起動後に少し待機
-                await asyncio.sleep(5.0)
-                self._reset_failures_func()
+                # 再起動後に十分な待機時間
+                await asyncio.sleep(10.0)
+                
+                # 再起動後の最終確認
+                final_issues = []
+                for adapter in self._adapters:
+                    status = await self._check_adapter_status(adapter)
+                    self._adapter_status[adapter] = status
+                    
+                    if status != "UP RUNNING":
+                        final_issues.append(adapter)
+                        logger.warning(f"Adapter {adapter} still has issues after service restart: {status}")
+                
+                if final_issues:
+                    logger.error(
+                        f"Failed to recover adapters {final_issues} after service restart. "
+                        "Manual intervention may be required."
+                    )
+                else:
+                    logger.info("All adapters recovered successfully after service restart")
+                    self._reset_failures_func()
+                    
+                    # スキャナーを再起動（追加）
+                    if self._scanner:
+                        try:
+                            logger.info("Restarting scanner after successful recovery")
+                            await self._scanner.stop()
+                            await asyncio.sleep(2.0)  # 少し待機
+                            await self._scanner.start()
+                            logger.info("Scanner restarted successfully after recovery")
+                        except Exception as e:
+                            logger.error(f"Failed to restart scanner after recovery: {e}")
             else:
-                logger.error(
-                    "Failed to recover BLE adapter. Manual intervention may be required."
-                )
+                logger.error("Failed to restart Bluetooth service")
+                # サービス再起動に失敗した場合でも、アダプタリセットが成功していれば失敗カウンタをリセット
+                if not adapter_issues or not still_problematic:
+                    logger.info("Adapter reset was successful, resetting failure counter despite service restart failure")
+                    self._reset_failures_func()
         
         except Exception as e:
             logger.error(f"Error during BLE adapter recovery: {e}")
         finally:
             self._recovery_in_progress = False
+            # 復旧完了を通知
+            self._recovery_completion_event.set()
+            
+            # コールバック関数を実行
+            for callback in self._recovery_callbacks:
+                try:
+                    callback()
+                except Exception as e:
+                    logger.error(f"Error in recovery completion callback: {e}")
+            
+            # イベントをリセット（次回の復旧に備えて）
+            self._recovery_completion_event.clear()
+
+    async def _check_adapter_status(self, adapter: str) -> str:
+        """
+        アダプタの状態を確認
+        """
+        try:
+            cmd = ADAPTER_STATUS_COMMAND.format(adapter=adapter)
+            result = await self._run_shell_command_with_output(cmd)
+            
+            if "UP RUNNING" in result:
+                return "UP RUNNING"
+            elif "DOWN" in result:
+                return "DOWN"
+            elif "No such device" in result:
+                return "NOT_FOUND"
+            else:
+                return "UNKNOWN"
+        except Exception as e:
+            logger.error(f"Error checking status for adapter {adapter}: {e}")
+            return "ERROR"
+
+    async def _reset_single_adapter(self, adapter: str) -> bool:
+        """
+        単一アダプタをリセット
+        """
+        try:
+            logger.info(f"Resetting adapter {adapter}")
+            reset_cmd = ADAPTER_RESET_COMMAND.format(adapter=adapter)
+            return await self._run_shell_command(reset_cmd)
+        except Exception as e:
+            logger.error(f"Error resetting adapter {adapter}: {e}")
+            return False
+
+    async def _run_shell_command_with_output(self, command: str) -> str:
+        """
+        シェルコマンドを実行して出力を取得
+        """
+        logger.debug(f"Running command: {command}")
+        
+        try:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                output = stdout.decode().strip()
+                logger.debug(f"Command succeeded: {output}")
+                return output
+            else:
+                error_output = stderr.decode().strip()
+                logger.error(f"Command failed with exit code {process.returncode}: {error_output}")
+                return error_output
+                
+        except Exception as e:
+            logger.error(f"Failed to execute command '{command}': {e}")
+            return str(e)
 
     async def _run_shell_command(self, command: str) -> bool:
         """
@@ -181,4 +489,88 @@ class BLEWatchdog:
                 
         except Exception as e:
             logger.error(f"Failed to execute command '{command}': {e}")
-            return False 
+            return False
+
+    async def _reset_adapters_only(self) -> None:
+        """
+        BleakClient失敗時の軽量なアダプタリセットのみを実行
+        Bluetoothサービス再起動は行わない
+        """
+        self._recovery_in_progress = True
+        
+        try:
+            logger.info(f"Starting lightweight adapter reset for BleakClient failure, adapters: {self._adapters}")
+            
+            # 各アダプタをリセット
+            reset_success_count = 0
+            for adapter in self._adapters:
+                logger.info(f"Resetting adapter {adapter} due to BleakClient failure")
+                success = await self._reset_single_adapter(adapter)
+                if success:
+                    logger.info(f"Successfully reset adapter {adapter}")
+                    reset_success_count += 1
+                else:
+                    logger.error(f"Failed to reset adapter {adapter}")
+            
+            # リセット後に少し待機
+            await asyncio.sleep(2.0)
+            
+            # リセット後の状態を確認
+            recovered_count = 0
+            for adapter in self._adapters:
+                status = await self._check_adapter_status(adapter)
+                self._adapter_status[adapter] = status
+                
+                if status == "UP RUNNING":
+                    recovered_count += 1
+                    logger.info(f"Adapter {adapter} recovered successfully")
+                else:
+                    logger.warning(f"Adapter {adapter} still has issues after reset: {status}")
+            
+            if recovered_count == len(self._adapters):
+                logger.info("All adapters recovered successfully after BleakClient failure")
+                self._reset_failures_func()
+                
+                # スキャナーを再起動（追加）
+                if self._scanner:
+                    try:
+                        logger.info("Restarting scanner after successful lightweight recovery")
+                        await self._scanner.stop()
+                        await asyncio.sleep(1.0)  # 少し待機
+                        await self._scanner.start()
+                        logger.info("Scanner restarted successfully after lightweight recovery")
+                    except Exception as e:
+                        logger.error(f"Failed to restart scanner after lightweight recovery: {e}")
+            elif reset_success_count > 0:
+                logger.info(f"Partial recovery: {recovered_count}/{len(self._adapters)} adapters recovered")
+                self._reset_failures_func()
+                
+                # 部分的な復旧でもスキャナーを再起動（追加）
+                if self._scanner:
+                    try:
+                        logger.info("Restarting scanner after partial recovery")
+                        await self._scanner.stop()
+                        await asyncio.sleep(1.0)  # 少し待機
+                        await self._scanner.start()
+                        logger.info("Scanner restarted successfully after partial recovery")
+                    except Exception as e:
+                        logger.error(f"Failed to restart scanner after partial recovery: {e}")
+            else:
+                logger.error("Failed to recover any adapters after BleakClient failure")
+        
+        except Exception as e:
+            logger.error(f"Error during lightweight adapter reset: {e}")
+        finally:
+            self._recovery_in_progress = False
+            # 復旧完了を通知
+            self._recovery_completion_event.set()
+            
+            # コールバック関数を実行
+            for callback in self._recovery_callbacks:
+                try:
+                    callback()
+                except Exception as e:
+                    logger.error(f"Error in recovery completion callback: {e}")
+            
+            # イベントをリセット（次回の復旧に備えて）
+            self._recovery_completion_event.clear() 

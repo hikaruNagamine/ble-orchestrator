@@ -99,6 +99,13 @@ class BLEOrchestratorClient:
             data, response_required, priority, timeout
         )
 
+    async def send_request(self, request: Dict[str, Any]) -> asyncio.Future:
+        """
+        直接的なリクエスト送信
+        任意のコマンドを送信してFutureを返す
+        """
+        return await self.req._send_request(request)
+
     # ---------------- 通知関連のProxy関数 ----------------
 
     async def subscribe_notifications(

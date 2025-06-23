@@ -22,20 +22,25 @@ class NotificationManager:
     デバイスごとの接続と通知コールバックを管理
     """
 
-    def __init__(self, get_device_func, notify_callback_func):
+    def __init__(self, get_device_func, notify_callback_func, scanner=None, notify_watchdog_func=None):
         """
         初期化
         get_device_func: BLEDeviceを取得する関数
         notify_callback_func: 通知時に呼び出すコールバック関数
+        scanner: スキャナーインスタンス（排他制御用）
+        notify_watchdog_func: ウォッチドッグ通知関数
         """
         self._get_device_func = get_device_func
         self._notify_callback_func = notify_callback_func
+        self._scanner = scanner  # スキャナーインスタンス
+        self._notify_watchdog_func = notify_watchdog_func  # ウォッチドッグ通知関数
         self._active_connections: Dict[str, BleakClient] = {}  # MAC -> Client
         self._subscriptions: Dict[str, Set[str]] = {}  # MAC -> Set[characteristic_uuid]
         self._callback_map: Dict[str, str] = {}  # 'MAC:uuid' -> callback_id
         self._tasks: Dict[str, asyncio.Task] = {}  # MAC -> Task
         self._lock = asyncio.Lock()
         self._is_running = True
+        self._exclusive_control_enabled = True  # 排他制御の有効/無効フラグ
 
     async def start(self) -> None:
         """
@@ -153,37 +158,101 @@ class NotificationManager:
             try:
                 logger.info(f"Connecting to {mac} for notifications")
                 
-                async with self._lock:
-                    # BLEクライアント作成と接続
-                    client = BleakClient(device, timeout=BLE_CONNECT_TIMEOUT_SEC)
-                    await client.connect()
-                    logger.info(f"Connected to {mac}")
-                    
-                    # 接続がうまくいったらリトライカウントをリセット
-                    retry_count = 0
-                    
-                    # 接続を記録
-                    self._active_connections[mac] = client
-                    
-                    # 必要な特性すべてをサブスクライブ
-                    for char_uuid in self._subscriptions.get(mac, set()):
+                # 排他制御が有効でスキャナーが設定されている場合
+                if self._exclusive_control_enabled and self._scanner:
+                    try:
+                        # スキャナー停止を要求
+                        self._scanner.request_scanner_stop()
+                        
+                        # スキャン停止完了を待機（タイムアウト付き）
+                        scan_completed_event = self._scanner.wait_for_scan_completed()
                         try:
-                            await client.start_notify(
-                                char_uuid, 
-                                lambda sender, data: asyncio.create_task(
-                                    self._notification_handler(mac, char_uuid, data)
+                            await asyncio.wait_for(scan_completed_event.wait(), timeout=10.0)  # 10秒タイムアウト
+                            scan_completed_event.clear()
+                            logger.debug("Scanner stopped for notification connection")
+                        except asyncio.TimeoutError:
+                            logger.warning("Timeout waiting for scanner stop completion, proceeding anyway")
+                            # タイムアウトしても処理を継続
+                    except Exception as e:
+                        logger.warning(f"Failed to stop scanner for notification connection: {e}")
+                
+                try:
+                    async with self._lock:
+                        # BLEクライアント作成と接続
+                        client = BleakClient(device, timeout=BLE_CONNECT_TIMEOUT_SEC)
+                        await client.connect()
+                        logger.info(f"Connected to {mac}")
+                        
+                        # 接続がうまくいったらリトライカウントをリセット
+                        retry_count = 0
+                        
+                        # 接続を記録
+                        self._active_connections[mac] = client
+                        
+                        # 必要な特性すべてをサブスクライブ
+                        for char_uuid in self._subscriptions.get(mac, set()):
+                            try:
+                                await client.start_notify(
+                                    char_uuid, 
+                                    lambda sender, data: asyncio.create_task(
+                                        self._notification_handler(mac, char_uuid, data)
+                                    )
                                 )
-                            )
-                            logger.debug(f"Subscribed to {char_uuid} on {mac}")
+                                logger.debug(f"Subscribed to {char_uuid} on {mac}")
+                            except Exception as e:
+                                logger.error(f"Failed to subscribe to {char_uuid} on {mac}: {e}")
+                    
+                    # 接続が切れるまで待機
+                    while client.is_connected and self._is_running:
+                        await asyncio.sleep(1)
+                    
+                    logger.info(f"Connection to {mac} lost")
+                    
+                except (BleakError, asyncio.TimeoutError) as e:
+                    retry_count += 1
+                    logger.warning(f"Failed to connect to {mac} (attempt {retry_count}/{max_retry}): {e}")
+                    
+                    # 最大リトライ回数に達した場合、watchdogに通知
+                    if retry_count >= max_retry:
+                        if self._notify_watchdog_func:
+                            logger.warning(f"BleakClient notification connection failed after {max_retry} attempts, notifying watchdog")
+                            self._notify_watchdog_func()
+                        break
+                    
+                    # リトライ前に待機
+                    await asyncio.sleep(retry_delay)
+                    
+                except Exception as e:
+                    logger.error(f"Unexpected error connecting to {mac}: {e}")
+                    retry_count += 1
+                    
+                    # 最大リトライ回数に達した場合、watchdogに通知
+                    if retry_count >= max_retry:
+                        if self._notify_watchdog_func:
+                            logger.warning(f"BleakClient notification connection failed after {max_retry} attempts, notifying watchdog")
+                            self._notify_watchdog_func()
+                        break
+                    
+                    await asyncio.sleep(retry_delay)
+                
+                finally:
+                    # 排他制御が有効でスキャナーが設定されている場合
+                    if self._exclusive_control_enabled and self._scanner:
+                        try:
+                            # クライアント処理完了を通知（成功・失敗に関係なく）
+                            self._scanner.notify_client_completed()
+                            logger.debug("Scanner can resume after notification connection")
                         except Exception as e:
-                            logger.error(f"Failed to subscribe to {char_uuid} on {mac}: {e}")
-                
-                # 接続が切れるまで待機
-                while self._is_running and client.is_connected:
-                    await asyncio.sleep(1.0)
-                
-                logger.info(f"Connection to {mac} was dropped")
-                
+                            logger.warning(f"Failed to notify scanner completion: {e}")
+                    
+                    # 接続をクリア
+                    if mac in self._active_connections:
+                        del self._active_connections[mac]
+                    
+                    # 接続が切れた場合、少し待機してから再接続
+                    if self._is_running:
+                        await asyncio.sleep(retry_delay)
+
             except asyncio.CancelledError:
                 logger.info(f"Connection task for {mac} cancelled")
                 break
@@ -196,17 +265,6 @@ class NotificationManager:
                     break
                 
                 await asyncio.sleep(retry_delay)
-            finally:
-                # 接続が切れたら情報をクリア
-                if mac in self._active_connections:
-                    try:
-                        client = self._active_connections[mac]
-                        if client.is_connected:
-                            await client.disconnect()
-                    except Exception as e:
-                        logger.error(f"Error disconnecting from {mac}: {e}")
-                    finally:
-                        del self._active_connections[mac]
         
         logger.info(f"Connection management task for {mac} terminated")
 
@@ -315,7 +373,17 @@ class NotificationManager:
         """
         アクティブなサブスクリプション数を取得
         """
-        count = 0
-        for mac in self._subscriptions:
-            count += len(self._subscriptions[mac])
-        return count 
+        return sum(len(subscriptions) for subscriptions in self._subscriptions.values())
+
+    def set_exclusive_control_enabled(self, enabled: bool) -> None:
+        """
+        排他制御の有効/無効を設定
+        """
+        self._exclusive_control_enabled = enabled
+        logger.info(f"Notification manager exclusive control {'enabled' if enabled else 'disabled'}")
+
+    def is_exclusive_control_enabled(self) -> bool:
+        """
+        排他制御が有効かどうかを確認
+        """
+        return self._exclusive_control_enabled 
