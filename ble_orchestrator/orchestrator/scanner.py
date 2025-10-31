@@ -195,6 +195,12 @@ class BLEScanner:
     """
 
     def __init__(self, notify_watchdog_func=None):
+        """
+        BLEScannerの初期化
+        
+        Args:
+            notify_watchdog_func: ウォッチドッグへの通知関数（オプション）
+        """
         self.is_running = False
         self._scanner_active = False  # 独自のスキャン状態管理フラグ
         self.scanner = BleakScanner(

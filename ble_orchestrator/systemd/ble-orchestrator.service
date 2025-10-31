@@ -10,6 +10,11 @@ StandardOutput=journal
 StandardError=journal
 TimeoutStopSec=10
 RestartSec=5
+Environment=BLE_ORCHESTRATOR_LOG_LEVEL=INFO
+# ファイル出力を無効化する場合は 0 に設定
+# Environment=BLE_ORCHESTRATOR_LOG_TO_FILE=0
+# ログディレクトリを明示的に指定（デフォルトは /var/log/ble-orchestrator または <PROJECT>/logs）
+# Environment=BLE_ORCHESTRATOR_LOG_DIR=/var/log/ble-orchestrator
 
 [Install]
 WantedBy=multi-user.target 

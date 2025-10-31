@@ -11,8 +11,22 @@ LOG_LEVEL = os.environ.get("BLE_ORCHESTRATOR_LOG_LEVEL", "INFO")
 
 # パス設定
 BASE_DIR = Path(__file__).parent.parent
-LOG_DIR = os.environ.get("BLE_ORCHESTRATOR_LOG_DIR", str(BASE_DIR / "logs"))
+
+# site-packages 配下にインストールされている場合は、デフォルトのログ出力先を /var/log/ble-orchestrator に切り替える
+_default_log_dir = (
+    Path("/var/log/ble-orchestrator")
+    if "site-packages" in str(BASE_DIR)
+    else BASE_DIR / "logs"
+)
+
+LOG_DIR = os.environ.get("BLE_ORCHESTRATOR_LOG_DIR", str(_default_log_dir))
 LOG_FILE = os.path.join(LOG_DIR, "ble_orchestrator.log")
+
+# ログ出力の詳細設定（環境変数で制御可能）
+# 例) BLE_ORCHESTRATOR_LOG_TO_FILE=0 でファイル出力を無効化
+LOG_TO_FILE = os.environ.get("BLE_ORCHESTRATOR_LOG_TO_FILE", "1") == "1"
+LOG_MAX_BYTES = int(os.environ.get("BLE_ORCHESTRATOR_LOG_MAX_BYTES", "10485760"))  # 10MB
+LOG_BACKUP_COUNT = int(os.environ.get("BLE_ORCHESTRATOR_LOG_BACKUP_COUNT", "5"))  # 世代数
 
 # BLE設定
 SCAN_INTERVAL_SEC = 0.5  # スキャン間隔（秒）

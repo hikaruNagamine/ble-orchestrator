@@ -5,6 +5,7 @@ BLE Orchestratorのメインサービスモジュール
 
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import time
 from typing import Dict, List, Optional, Any, Union, cast
@@ -12,7 +13,17 @@ import uuid
 
 from bleak.backends.device import BLEDevice
 
-from .config import LOG_DIR, LOG_FILE, DEFAULT_REQUEST_TIMEOUT_SEC, BLE_ADAPTERS, EXCLUSIVE_CONTROL_ENABLED
+from .config import (
+    LOG_DIR,
+    LOG_FILE,
+    LOG_TO_FILE,
+    LOG_MAX_BYTES,
+    LOG_BACKUP_COUNT,
+    LOG_LEVEL,
+    DEFAULT_REQUEST_TIMEOUT_SEC,
+    BLE_ADAPTERS,
+    EXCLUSIVE_CONTROL_ENABLED,
+)
 from .handler import BLERequestHandler
 from .ipc_server import IPCServer
 from .queue_manager import RequestQueueManager
@@ -119,18 +130,30 @@ class BLEOrchestratorService:
         
         # ルートロガー設定
         root_logger = logging.getLogger()
-        # root_logger.setLevel(logging.INFO)
-        root_logger.setLevel(logging.DEBUG)
+        try:
+            root_logger.setLevel(getattr(logging, str(LOG_LEVEL).upper(), logging.INFO))
+        except Exception:
+            root_logger.setLevel(logging.INFO)
         
-        # ファイルハンドラ
-        file_handler = logging.FileHandler(LOG_FILE)
-        file_handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S"
-            )
-        )
-        root_logger.addHandler(file_handler)
+        # ファイルハンドラ（回転）
+        if LOG_TO_FILE:
+            try:
+                file_handler = RotatingFileHandler(
+                    LOG_FILE,
+                    maxBytes=LOG_MAX_BYTES,
+                    backupCount=LOG_BACKUP_COUNT,
+                    encoding="utf-8"
+                )
+                file_handler.setFormatter(
+                    logging.Formatter(
+                        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S"
+                    )
+                )
+                root_logger.addHandler(file_handler)
+            except Exception as e:
+                # ファイルハンドラ追加に失敗した場合はコンソールのみにフォールバック
+                logging.getLogger(__name__).warning(f"File logging disabled due to error: {e}")
         
         # コンソールハンドラ
         console_handler = logging.StreamHandler()

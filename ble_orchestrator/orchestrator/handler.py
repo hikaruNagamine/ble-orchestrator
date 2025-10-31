@@ -50,17 +50,23 @@ class BLERequestHandler:
     async def handle_request(self, request: BLERequest) -> None:
         """
         リクエストの種類に応じた処理を実行
+        
+        Args:
+            request: 処理するBLEリクエスト
+            
+        Raises:
+            ValueError: 未知のリクエストタイプの場合
         """
         try:
-            logger.debug(f"&&&&&&&&&handle_request: {request}")
+            logger.debug(f"Processing request: {request.request_id} (type: {type(request).__name__})")
             if isinstance(request, ScanRequest):
                 await self._handle_scan_request(request)
             elif isinstance(request, ReadRequest):
                 await self._handle_read_request(request)
             elif isinstance(request, WriteRequest):
-                logger.debug(f"&&&&&&&&&handle_request: WriteRequest")
+                logger.debug(f"Processing WriteRequest: {request.request_id}")
                 await self._handle_write_request(request)
-                logger.debug(f"&&&&&&&&&handle_request: WriteRequest done")
+                logger.debug(f"WriteRequest completed: {request.request_id}")
             elif isinstance(request, NotificationRequest):
                 # 通知リクエストはメインサービスで直接処理されるので何もしない
                 logger.debug(f"Notification request {request.request_id} will be handled by notification manager")
@@ -72,7 +78,7 @@ class BLERequestHandler:
             
             # リクエスト完了をマーク
             request.mark_as_done()
-            logger.debug(f"&&&&&&&&&handle_request: done")
+            logger.debug(f"Request {request.request_id} completed successfully")
             
         except Exception as e:
             self._last_error = str(e)
