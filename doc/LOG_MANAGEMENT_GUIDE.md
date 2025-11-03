@@ -447,6 +447,72 @@ journalctl -u ble-orchestrator -f -p warning
 
 ---
 
+
 **最終更新**: 2025-10-24  
 **関連ドキュメント**: `REVIEW_SUMMARY.md`, `config.py`
 
+---
+
+## ⚠️ 緊急対応: 巨大なログファイル（例: 1.8GB）がある場合の安全な対処
+
+起動時に巨大なログファイルが残っているとディスクを圧迫します。サービスを止められるかどうかで対応を選んでください。
+
+1) サービスを止せない、または即時ディスクを開放したい場合（プロセスを停止せずに空にする）
+
+```bash
+# ファイルを空にしてディスクを開放（sudoが必要な場合あり）
+sudo truncate -s 0 /var/speedbeesynapse/projects/project1/dynlibs/pyvenv/lib/python3.11/site-packages/ble_orchestrator/logs/ble_orchestrator.log
+# もしくは
+sudo sh -c '> /var/speedbeesynapse/projects/project1/dynlibs/pyvenv/lib/python3.11/site-packages/ble_orchestrator/logs/ble_orchestrator.log'
+```
+
+注意: truncate はファイルを空にしますが、直近のログ内容を保存したい場合は次の「サービス停止」手順を使用してください。
+
+2) サービスを停止してログを保存・圧縮したい場合（推奨）
+
+```bash
+# systemd の例
+sudo systemctl stop ble-orchestrator.service
+
+# ログを移動して圧縮
+sudo mv /var/speedbeesynapse/projects/project1/dynlibs/pyvenv/lib/python3.11/site-packages/ble_orchestrator/logs/ble_orchestrator.log /tmp/ble_orchestrator.log
+sudo gzip /tmp/ble_orchestrator.log   # -> /tmp/ble_orchestrator.log.gz
+
+# サービスを再起動して新しいログを作らせる
+sudo systemctl start ble-orchestrator.service
+```
+
+3) どのプロセスがファイルを開いているか確認する
+
+```bash
+sudo lsof /var/speedbeesynapse/projects/project1/dynlibs/pyvenv/lib/python3.11/site-packages/ble_orchestrator/logs/ble_orchestrator.log
+```
+
+上記で PID がわかれば、そのプロセスを停止/再起動してログを切り替えられます。
+
+---
+
+## 🧾 リポジトリ内の logrotate 設定例
+
+リポジトリの `systemd/ble-orchestrator.logrotate` に運用例を追加しています。実運用では `/etc/logrotate.d/ble-orchestrator` として配置してください。
+
+基本例（`/etc/logrotate.d/ble-orchestrator` に配置）:
+
+```text
+/var/log/ble-orchestrator/*.log {
+        daily
+        rotate 14
+        compress
+        delaycompress
+        missingok
+        notifempty
+        create 0640 root root
+        sharedscripts
+        postrotate
+                # ログファイルを再オープンする方法。サービスに応じて reload / restart を選択
+                systemctl restart ble-orchestrator.service >/dev/null 2>&1 || true
+        endscript
+}
+```
+
+---

@@ -1,0 +1,17 @@
+# logrotate config example for ble-orchestrator
+# Install this as /etc/logrotate.d/ble-orchestrator on production systems.
+
+/var/log/ble-orchestrator/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    sharedscripts
+    postrotate
+        # Restart or reload service to reopen logs. Use reload if supported.
+        systemctl restart ble-orchestrator.service >/dev/null 2>&1 || true
+    endscript
+}

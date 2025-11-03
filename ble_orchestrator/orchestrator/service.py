@@ -8,6 +8,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import time
+import gzip
+import shutil
 from typing import Dict, List, Optional, Any, Union, cast
 import uuid
 
@@ -138,6 +140,25 @@ class BLEOrchestratorService:
         # ファイルハンドラ（回転）
         if LOG_TO_FILE:
             try:
+                # If an existing log file is already very large, compress/rotate it before attaching handlers.
+                # This prevents a previously-grown file from lingering (e.g. when rotation was not active
+                # or before the handler was added) and consuming disk space indefinitely.
+                try:
+                    if os.path.exists(LOG_FILE):
+                        existing_size = os.path.getsize(LOG_FILE)
+                        # If existing file is larger than the configured maxBytes, compress it once.
+                        if existing_size > LOG_MAX_BYTES:
+                            logger.info(
+                                f"Existing log file {LOG_FILE} is large ({existing_size} bytes). Compressing before starting."
+                            )
+                            compressed_path = LOG_FILE + ".1.gz"
+                            with open(LOG_FILE, "rb") as f_in, gzip.open(compressed_path, "wb") as f_out:
+                                shutil.copyfileobj(f_in, f_out)
+                            # remove the original large log so the RotatingFileHandler can create a fresh one
+                            os.remove(LOG_FILE)
+                except Exception as e:
+                    logger.warning(f"Pre-rotate/compress existing log failed: {e}")
+
                 file_handler = RotatingFileHandler(
                     LOG_FILE,
                     maxBytes=LOG_MAX_BYTES,
