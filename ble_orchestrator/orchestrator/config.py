@@ -31,9 +31,11 @@ LOG_BACKUP_COUNT = int(os.environ.get("BLE_ORCHESTRATOR_LOG_BACKUP_COUNT", "5"))
 # BLE設定
 SCAN_INTERVAL_SEC = 0.5  # スキャン間隔（秒）
 SCAN_CACHE_TTL_SEC = 300.0  # スキャン結果キャッシュ保持時間（秒）- 5分に延長
-BLE_CONNECT_TIMEOUT_SEC = 10.0  # 接続タイムアウト（秒）
+BLE_CONNECT_TIMEOUT_SEC = float(os.environ.get("BLE_ORCHESTRATOR_CONNECT_TIMEOUT", "20.0"))  # 接続タイムアウト（秒）- サービス発見に十分な時間を確保
 BLE_RETRY_COUNT = 2  # 接続リトライ回数
 BLE_RETRY_INTERVAL_SEC = 1.0  # リトライ間隔（秒）
+# 接続後のサービス発見完了待機時間（秒）- SwitchBot等のデバイスでサービス発見が完了するまで待機
+BLE_POST_CONNECT_WAIT_SEC = float(os.environ.get("BLE_ORCHESTRATOR_POST_CONNECT_WAIT", "0.5"))
 
 # BLEアダプタ設定
 BLE_ADAPTERS = ["hci0", "hci1"]  # 使用するBLEアダプタのリスト

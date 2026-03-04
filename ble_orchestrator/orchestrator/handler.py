@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, cast, Union
 from bleak import BleakClient, BleakError
 from bleak.backends.device import BLEDevice
 
-from .config import BLE_CONNECT_TIMEOUT_SEC, BLE_RETRY_COUNT, BLE_RETRY_INTERVAL_SEC, DEFAULT_CONNECT_ADAPTER
+from .config import BLE_CONNECT_TIMEOUT_SEC, BLE_RETRY_COUNT, BLE_RETRY_INTERVAL_SEC, DEFAULT_CONNECT_ADAPTER, BLE_POST_CONNECT_WAIT_SEC
 from .types import (
     BLERequest, ReadRequest, ScanRequest, WriteRequest, RequestStatus, 
     NotificationRequest
@@ -240,6 +240,12 @@ class BLERequestHandler:
                             async with BleakClient(device.address, timeout=BLE_CONNECT_TIMEOUT_SEC, adapter=DEFAULT_CONNECT_ADAPTER) as client:
                                 logger.debug(f"Connected to {device}")
                                 
+                                # サービス発見が完了するまで短い待機時間を追加
+                                # SwitchBot等のデバイスでサービス発見中に切断される問題を回避
+                                if BLE_POST_CONNECT_WAIT_SEC > 0:
+                                    await asyncio.sleep(BLE_POST_CONNECT_WAIT_SEC)
+                                    logger.debug(f"Post-connect wait completed ({BLE_POST_CONNECT_WAIT_SEC}s)")
+                                
                                 value = await client.read_gatt_char(request.characteristic_uuid)
                                 request.response_data = value
                                 request.status = RequestStatus.COMPLETED
@@ -251,9 +257,17 @@ class BLERequestHandler:
                                 return
                                 
                         except (BleakError, asyncio.TimeoutError) as e:
-                            logger.warning(
-                                f"Failed to read from {device} (attempt {retry+1}): {e}"
-                            )
+                            error_msg = str(e)
+                            # サービス発見関連のエラーの場合は詳細をログに記録
+                            if "discover services" in error_msg.lower() or "device disconnected" in error_msg.lower():
+                                logger.warning(
+                                    f"Failed to read from {device} (attempt {retry+1}/{BLE_RETRY_COUNT}): "
+                                    f"Service discovery failed or device disconnected - {error_msg}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"Failed to read from {device} (attempt {retry+1}/{BLE_RETRY_COUNT}): {error_msg}"
+                                )
                             if retry < BLE_RETRY_COUNT - 1:
                                 await asyncio.sleep(BLE_RETRY_INTERVAL_SEC)
                             else:
@@ -315,6 +329,12 @@ class BLERequestHandler:
                             async with BleakClient(device.address, timeout=BLE_CONNECT_TIMEOUT_SEC, adapter=DEFAULT_CONNECT_ADAPTER) as client:
                                 logger.debug(f"Connected to {device.address}")
                                 
+                                # サービス発見が完了するまで短い待機時間を追加
+                                # SwitchBot等のデバイスでサービス発見中に切断される問題を回避
+                                if BLE_POST_CONNECT_WAIT_SEC > 0:
+                                    await asyncio.sleep(BLE_POST_CONNECT_WAIT_SEC)
+                                    logger.debug(f"Post-connect wait completed ({BLE_POST_CONNECT_WAIT_SEC}s)")
+                                
                                 await client.write_gatt_char(
                                     request.characteristic_uuid, 
                                     request.data,
@@ -340,9 +360,17 @@ class BLERequestHandler:
                                 return
                                 
                         except (BleakError, asyncio.TimeoutError) as e:
-                            logger.warning(
-                                f"Failed to write to {device.address} (attempt {retry+1}): {e}"
-                            )
+                            error_msg = str(e)
+                            # サービス発見関連のエラーの場合は詳細をログに記録
+                            if "discover services" in error_msg.lower() or "device disconnected" in error_msg.lower():
+                                logger.warning(
+                                    f"Failed to write to {device.address} (attempt {retry+1}/{BLE_RETRY_COUNT}): "
+                                    f"Service discovery failed or device disconnected - {error_msg}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"Failed to write to {device.address} (attempt {retry+1}/{BLE_RETRY_COUNT}): {error_msg}"
+                                )
                             if retry < BLE_RETRY_COUNT - 1:
                                 await asyncio.sleep(BLE_RETRY_INTERVAL_SEC)
                             else:
