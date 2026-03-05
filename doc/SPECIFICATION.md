@@ -1,7 +1,7 @@
 # BLE Orchestrator 技術仕様書
 
-バージョン: 0.1.0  
-最終更新: 2025-10-24
+バージョン: 0.1.2  
+最終更新: 2026-3-5
 
 ---
 
@@ -646,9 +646,12 @@ class NotificationRequest(BLERequest):
 |---------|---------|-----------|------|
 | `SCAN_INTERVAL_SEC` | - | 0.5 | スキャン間隔（秒） |
 | `SCAN_CACHE_TTL_SEC` | - | 300.0 | キャッシュTTL（秒） |
-| `BLE_CONNECT_TIMEOUT_SEC` | - | 10.0 | 接続タイムアウト |
-| `BLE_RETRY_COUNT` | - | 2 | リトライ回数 |
-| `BLE_RETRY_INTERVAL_SEC` | - | 1.0 | リトライ間隔 |
+| `BLE_CONNECT_TIMEOUT_SEC` | `BLE_ORCHESTRATOR_CONNECT_TIMEOUT` | 20.0 | 接続タイムアウト（秒） |
+| `BLE_RETRY_COUNT` | `BLE_ORCHESTRATOR_RETRY_COUNT` | 2 | リトライ回数 |
+| `BLE_RETRY_INTERVAL_SEC` | `BLE_ORCHESTRATOR_RETRY_INTERVAL` | 1.0 | リトライ間隔（秒） |
+| `BLE_POST_CONNECT_WAIT_SEC` | `BLE_ORCHESTRATOR_POST_CONNECT_WAIT` | 0.5 | 接続直後のサービス発見完了待機時間（秒） |
+| `ENABLE_PRECONNECT_FIND` | `BLE_ORCHESTRATOR_ENABLE_PRECONNECT_FIND` | False | 接続前に簡易スキャンで到達可能性をチェックするか |
+| `PRECONNECT_FIND_TIMEOUT_SEC` | `BLE_ORCHESTRATOR_PRECONNECT_FIND_TIMEOUT` | 2.0 | preconnect find のタイムアウト（秒） |
 | `DEFAULT_SCAN_ADAPTER` | - | "hci0" | スキャン用アダプタ |
 | `DEFAULT_CONNECT_ADAPTER` | - | "hci1" | 接続用アダプタ |
 
