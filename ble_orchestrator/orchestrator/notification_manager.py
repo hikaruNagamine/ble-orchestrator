@@ -161,18 +161,9 @@ class NotificationManager:
                 # 排他制御が有効でスキャナーが設定されている場合
                 if self._exclusive_control_enabled and self._scanner:
                     try:
-                        # スキャナー停止を要求
-                        self._scanner.request_scanner_stop()
-                        
-                        # スキャン停止完了を待機（タイムアウト付き）
-                        scan_completed_event = self._scanner.wait_for_scan_completed()
-                        try:
-                            await asyncio.wait_for(scan_completed_event.wait(), timeout=10.0)  # 10秒タイムアウト
-                            scan_completed_event.clear()
-                            logger.debug("Scanner stopped for notification connection")
-                        except asyncio.TimeoutError:
-                            logger.warning("Timeout waiting for scanner stop completion, proceeding anyway")
-                            # タイムアウトしても処理を継続
+                        # スキャナー停止を要求し、停止完了まで待機
+                        await self._scanner.stop_for_client(timeout=10.0)
+                        logger.debug("Scanner stopped for notification connection")
                     except Exception as e:
                         logger.warning(f"Failed to stop scanner for notification connection: {e}")
                 
