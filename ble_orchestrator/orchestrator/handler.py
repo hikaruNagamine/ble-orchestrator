@@ -367,7 +367,7 @@ class BLERequestHandler:
     async def _get_device(self, mac_address: str) -> Optional[Union[BLEDevice, str]]:
         """
         BLEデバイスを取得
-        bleak 0.22.3では文字列のMACアドレスをそのまま使用可能
+        bleakでは文字列のMACアドレスをそのまま使用可能
         """
         device = self._get_device_func(mac_address)
         logger.debug(f"get_device: {device}")

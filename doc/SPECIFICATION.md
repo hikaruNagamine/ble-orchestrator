@@ -58,7 +58,7 @@ BLE Orchestratorは、複数のPythonスクリプトから安全にBLE（Bluetoo
 ### 技術スタック
 
 - **言語**: Python 3.9以上
-- **BLEライブラリ**: Bleak 0.21.1-0.22.x
+- **BLEライブラリ**: Bleak 1.0.0以上
 - **非同期処理**: asyncio
 - **IPC**: Unix Domain Socket / TCP Socket
 - **データシリアライゼーション**: JSON
