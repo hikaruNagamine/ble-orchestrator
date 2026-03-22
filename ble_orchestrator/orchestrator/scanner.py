@@ -29,16 +29,6 @@ SCANNER_START_TIMEOUT = 10.0
 # スキャナー停止のタイムアウト（秒）
 SCANNER_STOP_TIMEOUT = 10.0
 
-# BLE操作の排他制御用グローバルロック
-_ble_operation_lock = asyncio.Lock()
-
-# スキャナー排他制御用のグローバル変数
-_scanner_stopping = False  # スキャナー停止フラグ
-_client_connecting = False  # クライアント接続中フラグ
-_scan_ready = asyncio.Event()  # スキャン準備完了イベント
-_scan_completed = asyncio.Event()  # スキャン停止完了イベント
-_client_completed = asyncio.Event()  # クライアント完了イベント
-
 class ScanCache:
     """
     スキャン結果のキャッシュを管理するクラス
@@ -232,6 +222,16 @@ class BLEScanner:
         self._loop_activity_timeout = 180.0  # ループ活動タイムアウト（秒）
         self._loop_monitoring_enabled = True  # ループ監視の有効/無効フラグ
 
+        # BLE操作の排他制御用ロック（インスタンス単位）
+        self._ble_operation_lock = asyncio.Lock()
+
+        # スキャナー排他制御用の状態・イベント（インスタンス単位）
+        self._scanner_stopping = False  # スキャナー停止フラグ
+        self._client_connecting = False  # クライアント接続中フラグ
+        self._scan_ready = asyncio.Event()  # スキャン準備完了イベント
+        self._scan_completed = asyncio.Event()  # スキャン停止完了イベント
+        self._client_completed = asyncio.Event()  # クライアント完了イベント
+
     async def _detection_callback(self, device: BLEDevice, adv_data: AdvertisementData) -> None:
         """
         スキャン結果のコールバック
@@ -372,7 +372,7 @@ class BLEScanner:
             logger.info("Recreating scanner")
             
             # BLE操作の排他制御
-            async with _ble_operation_lock:
+            async with self._ble_operation_lock:
                 try:
                     # 現在のスキャナーを停止
                     await self._stop_current_scanner()
@@ -446,8 +446,6 @@ class BLEScanner:
         """
         スキャンループ
         """
-        global _scanner_stopping, _client_connecting, _scan_completed, _client_completed, _scan_ready
-        
         try:
             # スキャンループの開始　スキャンループの終了条件は、スキャン停止イベントが設定されている場合
             while not self._stop_event.is_set():
@@ -455,7 +453,7 @@ class BLEScanner:
                 self._update_loop_activity()
                 
                 # 排他制御が有効な場合、クライアント接続要求をチェック
-                if self._exclusive_control_enabled and _scanner_stopping:
+                if self._exclusive_control_enabled and self._scanner_stopping:
                     logger.info("scan loop: Scanner stop requested for client connection")
                     
                     # スキャン停止前の統計をログ出力
@@ -464,18 +462,18 @@ class BLEScanner:
                     
                     # スキャナーを停止
                     await self._stop_current_scanner()
-                    _scan_completed.set()  # スキャン停止完了を通知
+                    self._scan_completed.set()  # スキャン停止完了を通知
                     
                     # クライアント完了を待機（タイムアウト付き）
                     try:
-                        await asyncio.wait_for(_client_completed.wait(), timeout=CLIENT_COMPLETION_TIMEOUT)
+                        await asyncio.wait_for(self._client_completed.wait(), timeout=CLIENT_COMPLETION_TIMEOUT)
                     except asyncio.TimeoutError:
                         logger.warning("Timeout waiting for client completion, forcing scanner restart")
                         # タイムアウトした場合は強制的にスキャンを再開
                     except asyncio.CancelledError:
                         logger.warning("Scan loop cancelled")
                         break
-                    _client_completed.clear()  # イベントをリセット
+                    self._client_completed.clear()  # イベントをリセット
                     
                     # 停止イベントが設定されている場合は終了
                     if self._stop_event.is_set():
@@ -498,7 +496,7 @@ class BLEScanner:
                         # 再開に失敗した場合は再作成を試行
                         await self._recreate_scanner()
                     
-                    _scan_ready.set()  # スキャン準備完了を通知
+                    self._scan_ready.set()  # スキャン準備完了を通知
                 
                 # スキャナーはコールバック方式なので、待機するだけ
                 await asyncio.sleep(SCAN_INTERVAL_SEC)
@@ -510,9 +508,9 @@ class BLEScanner:
                     if exclusive_duration > self._deadlock_threshold:
                         logger.error(f"POTENTIAL DEADLOCK DETECTED: Exclusive control active for {exclusive_duration:.1f}s")
                         # デッドロックを検出した場合は強制的にリセット
-                        _scanner_stopping = False
-                        _client_connecting = False
-                        _client_completed.set()
+                        self._scanner_stopping = False
+                        self._client_connecting = False
+                        self._client_completed.set()
                         self._exclusive_control_start_time = None
                         logger.warning("Forced reset of exclusive control due to potential deadlock")
                 
@@ -596,9 +594,9 @@ class BLEScanner:
         logger.info("Starting BLE scanner")
         
         # 排他制御用イベントを初期化
-        _scan_ready.clear()
-        _scan_completed.clear()
-        _client_completed.clear()
+        self._scan_ready.clear()
+        self._scan_completed.clear()
+        self._client_completed.clear()
         
         try:
             await asyncio.wait_for(self.scanner.start(), timeout=SCANNER_START_TIMEOUT)
@@ -612,7 +610,7 @@ class BLEScanner:
             logger.info("BLE scanner started successfully")
             
             # スキャン準備完了を通知
-            _scan_ready.set()
+            self._scan_ready.set()
         except asyncio.TimeoutError:
             self.is_running = False
             self._scanner_active = False
@@ -628,20 +626,34 @@ class BLEScanner:
         """
         クライアント接続のためにスキャナー停止を要求
         """
-        global _scanner_stopping, _client_connecting
-        _scanner_stopping = True
-        _client_connecting = True
+        self._scanner_stopping = True
+        self._client_connecting = True
         self._exclusive_control_start_time = time.time()  # 排他制御開始時刻を記録
         logger.info("Scanner stop requested for client connection")
+
+    async def stop_for_client(self, timeout: float = 10.0) -> None:
+        """
+        クライアント接続のためにスキャナーを停止し、停止完了まで待機する高レベルAPI
+        """
+        # 停止を要求
+        self.request_scanner_stop()
+        
+        # スキャン停止完了を待機
+        try:
+            await asyncio.wait_for(self._scan_completed.wait(), timeout=timeout)
+            logger.debug("Scanner stopped for client operation")
+        except asyncio.TimeoutError:
+            logger.warning("Timeout waiting for scanner stop completion, proceeding anyway")
+        finally:
+            self._scan_completed.clear()
 
     def notify_client_completed(self) -> None:
         """
         クライアント処理完了を通知
         """
-        global _scanner_stopping, _client_connecting
-        _client_connecting = False
-        _scanner_stopping = False
-        _client_completed.set()
+        self._client_connecting = False
+        self._scanner_stopping = False
+        self._client_completed.set()
         
         # 排他制御時間をログ出力
         if self._exclusive_control_start_time:
@@ -655,13 +667,13 @@ class BLEScanner:
         """
         スキャン準備完了イベントを取得
         """
-        return _scan_ready
+        return self._scan_ready
 
     def wait_for_scan_completed(self) -> asyncio.Event:
         """
         スキャン停止完了イベントを取得
         """
-        return _scan_completed
+        return self._scan_completed
 
     def set_exclusive_control_enabled(self, enabled: bool) -> None:
         """
@@ -674,7 +686,7 @@ class BLEScanner:
         """
         クライアントが接続中かどうかを確認
         """
-        return _client_connecting
+        return self._client_connecting
 
     async def stop(self) -> None:
         """
@@ -717,7 +729,7 @@ class BLEScanner:
             # これにより、再作成中に停止処理が呼ばれても安全に処理できる
             async with self._recreate_lock:
                 # BLE操作の排他制御
-                async with _ble_operation_lock:
+                async with self._ble_operation_lock:
                     try:
                         # 既存のメソッドを再利用してスキャナーを停止
                         await self._stop_current_scanner()
