@@ -271,7 +271,7 @@ class BLEOrchestratorService:
     def _get_ble_device(self, mac_address: str) -> Optional[Union[BLEDevice, str]]:
         """
         スキャン結果からBLEDeviceを取得
-        bleak 0.22.3では文字列のMACアドレスを直接使用することも可能
+        bleakでは文字列のMACアドレスを直接使用することも可能
         """
         result = self.scanner.cache.get_latest_result(mac_address)
         if not result:

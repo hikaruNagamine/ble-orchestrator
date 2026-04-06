@@ -148,7 +148,7 @@ class NotificationManager:
         """
         デバイス接続の管理タスク
         接続を維持しながら必要な通知を購読
-        bleak 0.22.3ではデバイスにMACアドレス文字列を直接使用可能
+        bleakではデバイスにMACアドレス文字列を直接使用可能
         """
         retry_count = 0
         max_retry = 5
